@@ -1,0 +1,418 @@
+# ============================================================
+#  5_chart_signal.py — GRAPHIQUE DE CONFIRMATION DU SIGNAL
+#  Affiche le S&P500 avec tous les indicateurs pour valider
+#  la décision ACHAT / VENTE / NEUTRE
+# ============================================================
+
+import pandas as pd
+import numpy as np
+import sqlite3
+import joblib
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import matplotlib.patches as mpatches
+from matplotlib.lines import Line2D
+import warnings
+warnings.filterwarnings('ignore')
+import os
+
+os.makedirs("outputs", exist_ok=True)
+DB_PATH   = "data/market_data.db"
+N_JOURS   = 120   # nb de jours à afficher
+
+COULEURS = {
+    'bg':      '#0d1117',
+    'bg2':     '#161b22',
+    'border':  '#21262d',
+    'green':   '#2ecc71',
+    'red':     '#e74c3c',
+    'yellow':  '#f1c40f',
+    'blue':    '#3498db',
+    'purple':  '#9b59b6',
+    'cyan':    '#1abc9c',
+    'text':    '#e6edf3',
+    'muted':   '#7d8590',
+    'orange':  '#e67e22',
+}
+
+def style_dark():
+    plt.rcParams.update({
+        'figure.facecolor':  COULEURS['bg'],
+        'axes.facecolor':    COULEURS['bg2'],
+        'axes.edgecolor':    COULEURS['border'],
+        'axes.labelcolor':   COULEURS['text'],
+        'xtick.color':       COULEURS['text'],
+        'ytick.color':       COULEURS['text'],
+        'grid.color':        COULEURS['border'],
+        'text.color':        COULEURS['text'],
+        'legend.facecolor':  COULEURS['bg'],
+        'legend.edgecolor':  COULEURS['border'],
+        'font.family':       'monospace',
+        'font.size':         9,
+    })
+
+# ─────────────────────────────────────────
+# 1. CHARGER LES DONNÉES
+# ─────────────────────────────────────────
+def charger_donnees(n_jours=N_JOURS):
+    conn = sqlite3.connect(DB_PATH)
+    df   = pd.read_sql("SELECT * FROM sp500_ml_features",
+                        conn, index_col='date', parse_dates=['date'])
+    conn.close()
+    df.sort_index(inplace=True)
+    return df.iloc[-n_jours:].copy()
+
+# ─────────────────────────────────────────
+# 2. OBTENIR LE SIGNAL DES MODÈLES
+# ─────────────────────────────────────────
+def obtenir_signal(df):
+    try:
+        params    = joblib.load("models/regime_params.pkl")
+        vol_seuil = params.get('vol_seuil', df['vol_20d'].quantile(0.60))
+        vix_seuil = params.get('vix_seuil', 20.0)
+
+        last     = df.iloc[-1]
+        cond_vix = int(last.get('vix_close', 15) > vix_seuil)
+        cond_vol = int(last.get('vol_20d',  0.01) > vol_seuil)
+        cond_ma  = int(last.get('close',     1)   < last.get('ma_200', 1))
+        score    = cond_vix + cond_vol + cond_ma
+
+        # Déterminer régime
+        adx = last.get('adx_14', 0)
+        if score >= 2:
+            regime = "STRESSE"
+        elif adx > 20:
+            regime = "CALME_TENDANCE"
+        else:
+            regime = "CALME_LATERAL"
+
+        # Essayer de charger le modèle correspondant
+        for r in [regime, "CALME_TENDANCE", "STRESSE"]:
+            try:
+                ens    = joblib.load(f"models/ensemble_{r.lower()}.pkl")
+                scaler = joblib.load(f"models/scaler_{r.lower()}.pkl")
+                feats  = joblib.load(f"models/feats_{r.lower()}.pkl")
+                seuil  = joblib.load(f"models/seuil_{r.lower()}.pkl")
+                cols   = [f for f in feats if f in df.columns]
+                X      = np.array([[last.get(f, 0) for f in cols]])
+                X      = np.nan_to_num(X)
+                X_s    = np.nan_to_num(scaler.transform(X))
+                p_xgb  = ens['xgb'].predict_proba(X_s)[0, 1]
+                p_rf   = ens['rf'].predict_proba(X_s)[0, 1]
+                proba  = 0.60 * p_xgb + 0.40 * p_rf
+                regime = r
+                break
+            except:
+                continue
+        else:
+            proba  = 0.5
+            seuil  = 0.5
+            regime = "INCONNU"
+
+        conf   = params.get('confiance', {}).get(regime, {'achat': 0.60, 'vente': 0.40})
+        signal = "ACHAT"  if proba >= conf['achat'] else \
+                 "VENTE"  if proba <= conf['vente'] else "NEUTRE"
+        return signal, proba, regime, score
+
+    except Exception as e:
+        print(f"  ⚠️  Modèles non trouvés ({e}) → signal NEUTRE")
+        return "NEUTRE", 0.5, "INCONNU", 0
+
+# ─────────────────────────────────────────
+# 3. GRAPHIQUE PRINCIPAL
+# ─────────────────────────────────────────
+def tracer_graphique(df, signal, proba, regime, score):
+    style_dark()
+
+    fig = plt.figure(figsize=(20, 16))
+    fig.patch.set_facecolor(COULEURS['bg'])
+
+    gs = gridspec.GridSpec(
+        5, 1, figure=fig,
+        height_ratios=[4, 1.2, 1.2, 1.2, 1.2],
+        hspace=0.06
+    )
+
+    ax_prix  = fig.add_subplot(gs[0])
+    ax_vol   = fig.add_subplot(gs[1], sharex=ax_prix)
+    ax_rsi   = fig.add_subplot(gs[2], sharex=ax_prix)
+    ax_macd  = fig.add_subplot(gs[3], sharex=ax_prix)
+    ax_vix   = fig.add_subplot(gs[4], sharex=ax_prix)
+
+    dates = df.index
+    close = df['close']
+
+    col_signal = COULEURS['green'] if signal == 'ACHAT' else \
+                 COULEURS['red']   if signal == 'VENTE' else COULEURS['yellow']
+
+    # ═══════════════════════════════════════
+    # PANNEAU 1 — PRIX + MAs + BANDES BOLLINGER
+    # ═══════════════════════════════════════
+    # Chandeliers japonais
+    for i in range(len(df)):
+        o = df['open'].iloc[i]
+        h = df['high'].iloc[i]
+        l = df['low'].iloc[i]
+        c = df['close'].iloc[i]
+        color = COULEURS['green'] if c >= o else COULEURS['red']
+        ax_prix.plot([dates[i], dates[i]], [l, h], color=color,
+                     lw=0.8, alpha=0.7)
+        ax_prix.plot([dates[i], dates[i]], [min(o,c), max(o,c)],
+                     color=color, lw=3, solid_capstyle='round')
+
+    # Moyennes mobiles
+    ax_prix.plot(dates, df['ma_20'],  color=COULEURS['blue'],
+                 lw=1.4, label='MA20',  alpha=0.9)
+    ax_prix.plot(dates, df['ma_50'],  color=COULEURS['orange'],
+                 lw=1.4, label='MA50',  alpha=0.9)
+    ax_prix.plot(dates, df['ma_200'], color=COULEURS['purple'],
+                 lw=1.8, label='MA200', alpha=0.9, ls='--')
+
+    # Bandes de Bollinger
+    if 'bb_zscore' in df.columns:
+        ma20  = df['close'].rolling(20).mean()
+        std20 = df['close'].rolling(20).std()
+        bb_up = ma20 + 2 * std20
+        bb_dn = ma20 - 2 * std20
+        ax_prix.fill_between(dates, bb_dn, bb_up,
+                              alpha=0.08, color=COULEURS['blue'],
+                              label='Bollinger ±2σ')
+        ax_prix.plot(dates, bb_up, color=COULEURS['blue'],
+                     lw=0.6, alpha=0.4, ls=':')
+        ax_prix.plot(dates, bb_dn, color=COULEURS['blue'],
+                     lw=0.6, alpha=0.4, ls=':')
+
+    # Ligne verticale — dernier jour
+    ax_prix.axvline(dates[-1], color=col_signal, lw=1.5,
+                    ls='--', alpha=0.8)
+
+    # Signal box
+    prix_max = close.max()
+    prix_min = close.min()
+    emoji = "▲ ACHAT" if signal == 'ACHAT' else \
+            ("▼ VENTE" if signal == 'VENTE' else "◆ NEUTRE")
+    ax_prix.annotate(
+        f"  {emoji}\n  P={proba*100:.1f}%\n  {regime}",
+        xy=(dates[-1], close.iloc[-1]),
+        xytext=(dates[-min(15, len(dates)-1)], prix_max * 0.995),
+        fontsize=11, fontweight='bold', color=col_signal,
+        bbox=dict(boxstyle='round,pad=0.5', facecolor=COULEURS['bg'],
+                  edgecolor=col_signal, alpha=0.9),
+        arrowprops=dict(arrowstyle='->', color=col_signal, lw=1.5)
+    )
+
+    # Titre
+    date_str  = dates[-1].strftime('%d/%m/%Y')
+    prix_last = close.iloc[-1]
+    ret_5j    = (close.iloc[-1] / close.iloc[-6] - 1) * 100 if len(close) > 5 else 0
+    ret_col   = COULEURS['green'] if ret_5j > 0 else COULEURS['red']
+
+    ax_prix.set_title(
+        f"S&P 500  ·  {date_str}  ·  {prix_last:,.0f} pts  ·  "
+        f"Ret 5j : {ret_5j:+.2f}%",
+        fontsize=13, fontweight='bold', pad=12, color=COULEURS['text']
+    )
+    ax_prix.legend(loc='upper left', fontsize=9, ncol=4)
+    ax_prix.set_ylabel("Prix (pts)", fontsize=10)
+    ax_prix.grid(True, alpha=0.25)
+    ax_prix.yaxis.set_major_formatter(
+        plt.FuncFormatter(lambda x, _: f'{x:,.0f}')
+    )
+    plt.setp(ax_prix.get_xticklabels(), visible=False)
+
+    # ═══════════════════════════════════════
+    # PANNEAU 2 — VOLUME
+    # ═══════════════════════════════════════
+    colors_vol = [COULEURS['green'] if df['close'].iloc[i] >= df['open'].iloc[i]
+                  else COULEURS['red'] for i in range(len(df))]
+    ax_vol.bar(dates, df['volume'], color=colors_vol, alpha=0.6, width=0.8)
+    if 'vol_ratio' in df.columns:
+        vol_ma = df['volume'].rolling(20).mean()
+        ax_vol.plot(dates, vol_ma, color='white', lw=1.2,
+                    alpha=0.7, label='Vol MA20')
+    ax_vol.set_ylabel("Volume", fontsize=9)
+    ax_vol.legend(fontsize=8, loc='upper left')
+    ax_vol.grid(True, alpha=0.2)
+    ax_vol.yaxis.set_major_formatter(
+        plt.FuncFormatter(lambda x, _: f'{x/1e9:.1f}B')
+    )
+    plt.setp(ax_vol.get_xticklabels(), visible=False)
+
+    # ═══════════════════════════════════════
+    # PANNEAU 3 — RSI
+    # ═══════════════════════════════════════
+    if 'rsi_14' in df.columns:
+        rsi = df['rsi_14']
+        ax_rsi.plot(dates, rsi, color=COULEURS['cyan'],
+                    lw=1.5, label='RSI 14')
+        if 'rsi_7' in df.columns:
+            ax_rsi.plot(dates, df['rsi_7'], color=COULEURS['yellow'],
+                        lw=1.0, alpha=0.7, label='RSI 7')
+        ax_rsi.axhline(70, color=COULEURS['red'],   lw=1.0, ls='--',
+                        alpha=0.7, label='Surachat (70)')
+        ax_rsi.axhline(30, color=COULEURS['green'], lw=1.0, ls='--',
+                        alpha=0.7, label='Survente (30)')
+        ax_rsi.axhline(50, color='white', lw=0.6, ls=':', alpha=0.4)
+        ax_rsi.fill_between(dates, rsi, 70,
+                             where=(rsi >= 70), alpha=0.25,
+                             color=COULEURS['red'],   label='Zone surachat')
+        ax_rsi.fill_between(dates, rsi, 30,
+                             where=(rsi <= 30), alpha=0.25,
+                             color=COULEURS['green'], label='Zone survente')
+        ax_rsi.set_ylim(0, 100)
+        ax_rsi.set_ylabel("RSI", fontsize=9)
+        ax_rsi.legend(fontsize=7, loc='upper left', ncol=3)
+        ax_rsi.grid(True, alpha=0.2)
+        # Dernier RSI
+        ax_rsi.annotate(f"RSI={rsi.iloc[-1]:.1f}",
+                         xy=(dates[-1], rsi.iloc[-1]),
+                         fontsize=8, color=COULEURS['cyan'],
+                         xytext=(5, 0), textcoords='offset points')
+    plt.setp(ax_rsi.get_xticklabels(), visible=False)
+
+    # ═══════════════════════════════════════
+    # PANNEAU 4 — MACD
+    # ═══════════════════════════════════════
+    if 'macd' in df.columns:
+        macd   = df['macd']
+        signal_line = df['macd_signal']
+        hist   = df['macd_hist']
+
+        colors_macd = [COULEURS['green'] if v >= 0 else COULEURS['red']
+                       for v in hist]
+        ax_macd.bar(dates, hist, color=colors_macd, alpha=0.7, width=0.8)
+        ax_macd.plot(dates, macd,        color=COULEURS['blue'],
+                     lw=1.5, label='MACD')
+        ax_macd.plot(dates, signal_line, color=COULEURS['orange'],
+                     lw=1.5, label='Signal')
+        ax_macd.axhline(0, color='white', lw=0.8, ls='--', alpha=0.5)
+        ax_macd.set_ylabel("MACD", fontsize=9)
+        ax_macd.legend(fontsize=8, loc='upper left', ncol=3)
+        ax_macd.grid(True, alpha=0.2)
+        # Annotation croisement
+        for i in range(1, len(df)):
+            if (macd.iloc[i] > signal_line.iloc[i] and
+                    macd.iloc[i-1] <= signal_line.iloc[i-1]):
+                ax_macd.annotate('▲', xy=(dates[i], macd.iloc[i]),
+                                  color=COULEURS['green'], fontsize=10)
+            elif (macd.iloc[i] < signal_line.iloc[i] and
+                      macd.iloc[i-1] >= signal_line.iloc[i-1]):
+                ax_macd.annotate('▼', xy=(dates[i], macd.iloc[i]),
+                                  color=COULEURS['red'], fontsize=10)
+    plt.setp(ax_macd.get_xticklabels(), visible=False)
+
+    # ═══════════════════════════════════════
+    # PANNEAU 5 — VIX
+    # ═══════════════════════════════════════
+    if 'vix_close' in df.columns:
+        vix = df['vix_close']
+        ax_vix.fill_between(dates, vix, alpha=0.35,
+                             color=COULEURS['red'], label='VIX')
+        ax_vix.plot(dates, vix, color=COULEURS['red'], lw=1.5)
+
+        # Zones VIX
+        ax_vix.axhline(20, color=COULEURS['yellow'], lw=1.2, ls='--',
+                        alpha=0.8, label='Seuil stress (20)')
+        ax_vix.axhline(30, color=COULEURS['red'],    lw=1.2, ls='--',
+                        alpha=0.8, label='Panique (30)')
+        ax_vix.fill_between(dates, 20, vix.clip(upper=30),
+                             where=(vix >= 20), alpha=0.12,
+                             color=COULEURS['yellow'])
+        ax_vix.fill_between(dates, 30, vix.clip(lower=30),
+                             where=(vix >= 30), alpha=0.25,
+                             color=COULEURS['red'])
+
+        ax_vix.set_ylabel("VIX", fontsize=9)
+        ax_vix.legend(fontsize=8, loc='upper left', ncol=3)
+        ax_vix.grid(True, alpha=0.2)
+
+        # Dernier VIX
+        vix_last = vix.iloc[-1]
+        vix_col  = COULEURS['red'] if vix_last > 20 else COULEURS['green']
+        ax_vix.annotate(f"VIX={vix_last:.1f}",
+                         xy=(dates[-1], vix_last),
+                         fontsize=9, color=vix_col, fontweight='bold',
+                         xytext=(-40, 8), textcoords='offset points')
+
+    # ─────────────────────────────────────
+    # BANDE DE SIGNAL EN HAUT
+    # ─────────────────────────────────────
+    fig.text(0.5, 0.97,
+             f"SIGNAL : {signal}  |  P(hausse 5j) = {proba*100:.1f}%  "
+             f"|  Régime = {regime}  |  Score stress = {score}/3",
+             ha='center', va='top', fontsize=13, fontweight='bold',
+             color=col_signal,
+             bbox=dict(boxstyle='round,pad=0.4', facecolor=COULEURS['bg2'],
+                       edgecolor=col_signal, alpha=0.95))
+
+    # ─────────────────────────────────────
+    # TABLEAU RÉSUMÉ DES INDICATEURS
+    # ─────────────────────────────────────
+    last = df.iloc[-1]
+    rsi_val  = last.get('rsi_14', 0)
+    macd_val = last.get('macd_hist', 0)
+    bb_val   = last.get('bb_zscore', 0)
+    adx_val  = last.get('adx_14', 0)
+    vix_val  = last.get('vix_close', 0)
+
+    def feu(val, seuil_pos, seuil_neg, inverse=False):
+        if not inverse:
+            if val > seuil_pos: return '🟢'
+            if val < seuil_neg: return '🔴'
+        else:
+            if val < seuil_pos: return '🟢'
+            if val > seuil_neg: return '🔴'
+        return '🟡'
+
+    resume = [
+        f"RSI14 = {rsi_val:.1f}  {feu(rsi_val, 55, 45)}",
+        f"MACD hist = {macd_val:.2f}  {feu(macd_val, 0, 0)}",
+        f"BB zscore = {bb_val:.2f}  {feu(bb_val, 0, -1, inverse=True)}",
+        f"ADX = {adx_val:.1f}  {'🟢 tendance' if adx_val>25 else '🟡 neutre'}",
+        f"VIX = {vix_val:.1f}  {feu(vix_val, 0, 20, inverse=True)}",
+        f"MA200 = {'✅ AU-DESSUS' if last.get('close',0) > last.get('ma_200',0) else '⚠️ SOUS'}",
+    ]
+
+    fig.text(0.01, 0.03,
+             "  INDICATEURS :  " + "   |   ".join(resume),
+             ha='left', va='bottom', fontsize=9,
+             color=COULEURS['muted'],
+             bbox=dict(boxstyle='round', facecolor=COULEURS['bg2'],
+                       edgecolor=COULEURS['border'], alpha=0.9))
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.96])
+
+    chemin = "outputs/chart_signal.png"
+    plt.savefig(chemin, dpi=150, bbox_inches='tight',
+                facecolor=COULEURS['bg'])
+    plt.close()
+    print(f"  → {chemin}")
+    return chemin
+
+# ─────────────────────────────────────────
+# EXÉCUTION
+# ─────────────────────────────────────────
+if __name__ == "__main__":
+    print("=" * 55)
+    print("  GRAPHIQUE DE CONFIRMATION DU SIGNAL")
+    print("=" * 55)
+
+    print("Chargement des données...")
+    df = charger_donnees(N_JOURS)
+    print(f"  {len(df)} jours chargés ({df.index[0].strftime('%d/%m/%Y')}"
+          f" → {df.index[-1].strftime('%d/%m/%Y')})")
+
+    print("Calcul du signal...")
+    signal, proba, regime, score = obtenir_signal(df)
+    print(f"  Signal  : {signal}")
+    print(f"  Proba   : {proba*100:.1f}%")
+    print(f"  Régime  : {regime}")
+
+    print("Génération du graphique...")
+    chemin = tracer_graphique(df, signal, proba, regime, score)
+
+    print(f"\nOuvre le graphique :")
+    print(f"  start {chemin}")
+    os.system(f'start "" "{os.path.abspath(chemin)}"')
