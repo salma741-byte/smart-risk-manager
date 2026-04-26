@@ -1,11 +1,6 @@
 # ============================================================
-#  2_train_models_FINAL_V3.py
-#  Problème résolu : régime CALME AUC ~0.54 trop faible
-#  Solution :
-#    1. Zone de CONFIANCE — on ne trade que quand le modèle
-#       est sûr (proba < 0.35 ou > 0.65)
-#    2. Régime CALME subdivisé en CALME_TENDANCE / CALME_LATERAL
-#    3. Optuna installé → pip install optuna
+#  2_train_models_FINAL_V3.py — VERSION CORRIGÉE
+#  3 Régimes + Zones de confiance + Optuna + Ensemble calibré
 # ============================================================
 
 import pandas as pd
@@ -17,6 +12,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 from sklearn.preprocessing      import StandardScaler
+from sklearn.calibration        import CalibratedClassifierCV
 from sklearn.ensemble           import RandomForestClassifier
 from sklearn.metrics            import (accuracy_score, classification_report,
                                          roc_auc_score, f1_score, confusion_matrix)
@@ -39,19 +35,12 @@ VIX_SEUIL      = 20.0
 VOL_PERCENTILE = 60
 N_TRIALS       = 50
 
-# ─────────────────────────────────────────
-# SEUILS DE CONFIANCE PAR RÉGIME
-# En CALME le modèle est faible → zone neutre plus large
-# ─────────────────────────────────────────
 CONFIANCE = {
-    "STRESSE":        {'achat': 0.60, 'vente': 0.40},  # confiant
-    "CALME_TENDANCE": {'achat': 0.62, 'vente': 0.38},  # assez confiant
-    "CALME_LATERAL":  {'achat': 0.65, 'vente': 0.35},  # peu confiant → zone neutre large
+    "STRESSE":        {'achat': 0.58, 'vente': 0.42},
+    "CALME_TENDANCE": {'achat': 0.60, 'vente': 0.40},
+    "CALME_LATERAL":  {'achat': 0.62, 'vente': 0.38},
 }
 
-# ─────────────────────────────────────────
-# 1. CHARGEMENT
-# ─────────────────────────────────────────
 def charger_dataset():
     conn = sqlite3.connect(DB_PATH)
     df   = pd.read_sql("SELECT * FROM sp500_ml_features",
@@ -64,34 +53,19 @@ def charger_dataset():
     df.sort_index(inplace=True)
     return df, fc, fs
 
-# ─────────────────────────────────────────
-# 2. DÉTECTION RÉGIME AFFINÉE — 3 régimes
-#    STRESSÉ       : VIX élevé + volatilité haute
-#    CALME_TENDANCE: ADX > 20, prix suit une direction claire
-#    CALME_LATERAL : ADX < 20, marché sans direction → le plus difficile
-# ─────────────────────────────────────────
 def detecter_regime_affine(df):
-    vol_seuil = df['vol_20d'].quantile(VOL_PERCENTILE / 100)
-
-    # Conditions stress
-    cond_vix = (df['vix_close'] > VIX_SEUIL).astype(int)
-    cond_vol = (df['vol_20d']   > vol_seuil).astype(int)
-    cond_ma  = (df['close']     < df['ma_200']).astype(int)
+    vol_seuil  = df['vol_20d'].quantile(VOL_PERCENTILE / 100)
+    cond_vix   = (df['vix_close'] > VIX_SEUIL).astype(int)
+    cond_vol   = (df['vol_20d']   > vol_seuil).astype(int)
+    cond_ma    = (df['close']     < df['ma_200']).astype(int)
     est_stress = ((cond_vix + cond_vol + cond_ma) >= 2)
 
-    # Conditions calme avec tendance (ADX > 20)
-    adx_col = 'adx_14' if 'adx_14' in df.columns else None
-    if adx_col:
-        est_tendance = (~est_stress) & (df[adx_col] > 20)
-        est_lateral  = (~est_stress) & (df[adx_col] <= 20)
+    if 'adx_14' in df.columns:
+        est_tendance = (~est_stress) & (df['adx_14'] > 20)
     else:
-        # Fallback : utiliser la pente MA comme proxy
-        ma_pente = df['close'].rolling(20).mean().pct_change(5).abs()
-        seuil_pente = ma_pente.quantile(0.40)
-        est_tendance = (~est_stress) & (ma_pente > seuil_pente)
-        est_lateral  = (~est_stress) & (ma_pente <= seuil_pente)
+        ma_pente     = df['close'].rolling(20).mean().pct_change(5).abs()
+        est_tendance = (~est_stress) & (ma_pente > ma_pente.quantile(0.40))
 
-    # Encoder : 0=CALME_LATERAL, 1=CALME_TENDANCE, 2=STRESSE
     regime = pd.Series(0, index=df.index)
     regime[est_tendance] = 1
     regime[est_stress]   = 2
@@ -105,9 +79,6 @@ def detecter_regime_affine(df):
     print(f"  CALME_LATERAL  : {n_lat}j ({n_lat/n_tot*100:.1f}%)")
     return regime, vol_seuil
 
-# ─────────────────────────────────────────
-# 3. NETTOYAGE
-# ─────────────────────────────────────────
 def preparer_X(df, feat_cols):
     cols = [c for c in feat_cols if c in df.columns]
     X    = df[cols].copy()
@@ -115,15 +86,11 @@ def preparer_X(df, feat_cols):
     for col in X.columns:
         if X[col].isna().any():
             X[col].fillna(X[col].median(), inplace=True)
-    for col in X.columns:
-        std = X[col].std()
-        if std > 0:
-            X[col] = X[col].clip(X[col].mean()-10*std, X[col].mean()+10*std)
+        q_low  = X[col].quantile(0.01)
+        q_high = X[col].quantile(0.99)
+        X[col] = X[col].clip(q_low, q_high)
     return X.values, cols
 
-# ─────────────────────────────────────────
-# 4. SEUIL OPTIMAL
-# ─────────────────────────────────────────
 def trouver_seuil_optimal(y_true, probas):
     auc = roc_auc_score(y_true, probas)
     if auc < 0.50:
@@ -140,15 +107,12 @@ def trouver_seuil_optimal(y_true, probas):
             meilleur_seuil = seuil
     return meilleur_seuil, probas
 
-# ─────────────────────────────────────────
-# 5. OPTUNA
-# ─────────────────────────────────────────
 def optimiser_xgb(X_train, y_train, n_trials=N_TRIALS):
     if not OPTUNA_OK:
         return None
     print(f"  Optuna : {n_trials} essais...")
     tscv = TimeSeriesSplit(n_splits=4)
-    cw   = compute_class_weight('balanced', classes=np.array([0,1]), y=y_train)
+    cw   = compute_class_weight('balanced', classes=np.array([0, 1]), y=y_train)
     sw   = np.where(y_train == 1, cw[1], cw[0])
 
     def objective(trial):
@@ -163,27 +127,27 @@ def optimiser_xgb(X_train, y_train, n_trials=N_TRIALS):
             'reg_alpha':        trial.suggest_float('alp', 0.0, 1.0),
             'reg_lambda':       trial.suggest_float('lam', 0.5, 3.0),
         }
-        sp = max(0.5, (y_train==0).sum() / max(1, (y_train==1).sum()))
+        sp = max(0.5, (y_train == 0).sum() / max(1, (y_train == 1).sum()))
         scores = []
         for tr_i, va_i in tscv.split(X_train):
             if len(np.unique(y_train[va_i])) < 2:
                 continue
-            sc = StandardScaler()
+            sc  = StandardScaler()
             Xtr = np.nan_to_num(sc.fit_transform(X_train[tr_i]))
             Xva = np.nan_to_num(sc.transform(X_train[va_i]))
-            m = xgb.XGBClassifier(**p, scale_pos_weight=sp,
-                                   eval_metric='auc', use_label_encoder=False,
-                                   random_state=42, n_jobs=-1, verbosity=0)
+            m   = xgb.XGBClassifier(**p, scale_pos_weight=sp,
+                                     eval_metric='auc',
+                                     use_label_encoder=False,
+                                     random_state=42, n_jobs=-1, verbosity=0)
             m.fit(Xtr, y_train[tr_i], sample_weight=sw[tr_i], verbose=False)
             scores.append(roc_auc_score(y_train[va_i],
-                                         m.predict_proba(Xva)[:,1]))
+                                         m.predict_proba(Xva)[:, 1]))
         return np.mean(scores) if scores else 0.5
 
     study = optuna.create_study(direction='maximize',
                                  sampler=optuna.samplers.TPESampler(seed=42))
     study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
     bp = study.best_params
-    # Renommer les clés
     return {
         'n_estimators':     bp['n_estimators'],
         'max_depth':        bp['max_depth'],
@@ -196,9 +160,6 @@ def optimiser_xgb(X_train, y_train, n_trials=N_TRIALS):
         'reg_lambda':       bp['lam'],
     }
 
-# ─────────────────────────────────────────
-# 6. ENTRAÎNEMENT PAR RÉGIME
-# ─────────────────────────────────────────
 PARAMS_DEFAUT = {
     "STRESSE": dict(n_estimators=300, max_depth=3, learning_rate=0.02,
                     subsample=0.65, colsample_bytree=0.65,
@@ -208,10 +169,10 @@ PARAMS_DEFAUT = {
                             subsample=0.75, colsample_bytree=0.75,
                             min_child_weight=15, gamma=0.15,
                             reg_alpha=0.15, reg_lambda=1.5),
-    "CALME_LATERAL": dict(n_estimators=200, max_depth=2, learning_rate=0.02,
+    "CALME_LATERAL": dict(n_estimators=100, max_depth=1, learning_rate=0.01,
                            subsample=0.60, colsample_bytree=0.60,
-                           min_child_weight=30, gamma=0.4,
-                           reg_alpha=0.5, reg_lambda=2.5),
+                           min_child_weight=45, gamma=0.4,
+                           reg_alpha=0.5, reg_lambda=5.0),
 }
 
 def entrainer_modele(X_train, y_train, X_test, y_test, nom, feat_cols):
@@ -228,19 +189,23 @@ def entrainer_modele(X_train, y_train, X_test, y_test, nom, feat_cols):
     X_tr_s = np.nan_to_num(scaler.fit_transform(X_train))
     X_te_s = np.nan_to_num(scaler.transform(X_test))
 
-    sp = max(0.5, (y_train==0).sum() / max(1, (y_train==1).sum()))
-    cw = compute_class_weight('balanced', classes=np.array([0,1]), y=y_train)
+    sp = max(0.5, (y_train == 0).sum() / max(1, (y_train == 1).sum()))
+    cw = compute_class_weight('balanced', classes=np.array([0, 1]), y=y_train)
     sw = np.where(y_train == 1, cw[1], cw[0])
 
-    # Optuna ou défaut
-    best_p = optimiser_xgb(X_tr_s, y_train) or PARAMS_DEFAUT.get(nom, PARAMS_DEFAUT["CALME_TENDANCE"])
+    best_p = optimiser_xgb(X_tr_s, y_train) or PARAMS_DEFAUT.get(
+        nom, PARAMS_DEFAUT["CALME_TENDANCE"])
 
-    # XGBoost
-    xgb_m = xgb.XGBClassifier(**best_p, scale_pos_weight=sp,
-                                eval_metric='auc', use_label_encoder=False,
-                                random_state=42, n_jobs=-1)
-    xgb_m.fit(X_tr_s, y_train, sample_weight=sw,
-               eval_set=[(X_te_s, y_test)], verbose=False)
+    # XGBoost + calibration
+    xgb_base = xgb.XGBClassifier(
+        **best_p, scale_pos_weight=sp,
+        eval_metric='auc', use_label_encoder=False,
+        random_state=42, n_jobs=-1
+    )
+    xgb_base.fit(X_tr_s, y_train, sample_weight=sw, verbose=False)
+
+    xgb_m = CalibratedClassifierCV(xgb_base, method='isotonic', cv=3)
+    xgb_m.fit(X_tr_s, y_train)
 
     # Random Forest
     rf_m = RandomForestClassifier(
@@ -253,57 +218,53 @@ def entrainer_modele(X_train, y_train, X_test, y_test, nom, feat_cols):
     )
     rf_m.fit(X_tr_s, y_train)
 
-    # Probas ensemble
-    p_xgb = xgb_m.predict_proba(X_te_s)[:, 1]
-    p_rf  = rf_m.predict_proba(X_te_s)[:, 1]
-    probas_ens = 0.60 * p_xgb + 0.40 * p_rf
-
+    # Probas & poids dynamiques
+    p_xgb   = xgb_m.predict_proba(X_te_s)[:, 1]
+    p_rf    = rf_m.predict_proba(X_te_s)[:, 1]
     auc_xgb = roc_auc_score(y_test, p_xgb)
     auc_rf  = roc_auc_score(y_test, p_rf)
-    auc_ens = roc_auc_score(y_test, probas_ens)
-    print(f"  AUC XGB={auc_xgb:.4f} | RF={auc_rf:.4f} | Ensemble={auc_ens:.4f}")
+    w_xgb   = auc_xgb / (auc_xgb + auc_rf)
+    w_rf    = auc_rf  / (auc_xgb + auc_rf)
+
+    probas_ens = w_xgb * p_xgb + w_rf * p_rf
+    auc_ens    = roc_auc_score(y_test, probas_ens)
+    print(f"  AUC XGB={auc_xgb:.4f} | RF={auc_rf:.4f} | "
+          f"Ensemble={auc_ens:.4f} (w_xgb={w_xgb:.2f})")
 
     seuil, probas_corr = trouver_seuil_optimal(y_test, probas_ens)
     preds = (probas_corr >= seuil).astype(int)
+    acc   = accuracy_score(y_test, preds)
 
-    acc = accuracy_score(y_test, preds)
     print(f"  Seuil={seuil:.2f} | Accuracy={acc:.4f} | AUC={auc_ens:.4f}")
     print(classification_report(y_test, preds,
-                                  target_names=['Baisse','Hausse'],
+                                  target_names=['Baisse', 'Hausse'],
                                   zero_division=0))
     print("  Confusion :")
     print(confusion_matrix(y_test, preds))
 
-    # ── ANALYSE DE CONFIANCE ─────────────────────────────────────
     conf_achat = CONFIANCE.get(nom, CONFIANCE["CALME_LATERAL"])['achat']
     conf_vente = CONFIANCE.get(nom, CONFIANCE["CALME_LATERAL"])['vente']
-    n_achat  = (probas_corr >= conf_achat).sum()
-    n_vente  = (probas_corr <= conf_vente).sum()
-    n_neutre = len(probas_corr) - n_achat - n_vente
+    n_achat    = (probas_corr >= conf_achat).sum()
+    n_vente    = (probas_corr <= conf_vente).sum()
+    n_neutre   = len(probas_corr) - n_achat - n_vente
     print(f"\n  Distribution signaux (seuils {conf_vente:.2f}/{conf_achat:.2f}) :")
     print(f"    🟢 ACHAT  : {n_achat}  ({n_achat/len(probas_corr)*100:.1f}%)")
     print(f"    🟡 NEUTRE : {n_neutre} ({n_neutre/len(probas_corr)*100:.1f}%)")
     print(f"    🔴 VENTE  : {n_vente}  ({n_vente/len(probas_corr)*100:.1f}%)")
 
-    # Accuracy sur les signaux CONFIANTS seulement
-    masque_confiant = (probas_corr >= conf_achat) | (probas_corr <= conf_vente)
-    if masque_confiant.sum() > 0:
-        acc_conf = accuracy_score(y_test[masque_confiant],
-                                   preds[masque_confiant])
-        print(f"  Accuracy sur signaux confiants : {acc_conf:.4f} "
-              f"(n={masque_confiant.sum()})")
+    masque = (probas_corr >= conf_achat) | (probas_corr <= conf_vente)
+    if masque.sum() > 0:
+        acc_conf = accuracy_score(y_test[masque], preds[masque])
+        print(f"  Accuracy signaux confiants : {acc_conf:.4f} (n={masque.sum()})")
 
-    imp = pd.Series(xgb_m.feature_importances_, index=feat_cols)
+    imp = pd.Series(xgb_base.feature_importances_, index=feat_cols)
     print("\n  Top 6 features :")
     for fname, fval in imp.nlargest(6).items():
         print(f"    {fname:<32} {fval:.4f}")
 
-    ensemble = {'xgb': xgb_m, 'rf': rf_m, 'w_xgb': 0.60, 'w_rf': 0.40}
+    ensemble = {'xgb': xgb_m, 'rf': rf_m, 'w_xgb': w_xgb, 'w_rf': w_rf}
     return ensemble, scaler, probas_corr, seuil
 
-# ─────────────────────────────────────────
-# 7. SIGNAL DU JOUR
-# ─────────────────────────────────────────
 def predire(ensemble, scaler, X_raw):
     X_s   = np.nan_to_num(scaler.transform(X_raw))
     p_xgb = ensemble['xgb'].predict_proba(X_s)[:, 1]
@@ -330,15 +291,16 @@ def signal_du_jour(df, resultats, vol_seuil):
 
     print(f"  Date   : {df.index[-1].strftime('%Y-%m-%d')}")
     print(f"  Régime : {regime}  (score stress {score}/3)")
-    print(f"    VIX={last.get('vix_close',0):.1f} | "
-          f"Vol={last.get('vol_20d',0):.4f} | "
-          f"ADX={last.get('adx_14',0):.1f} | "
+    print(f"    VIX={last.get('vix_close', 0):.1f} | "
+          f"Vol={last.get('vol_20d', 0):.4f} | "
+          f"ADX={last.get('adx_14', 0):.1f} | "
           f"MA200={'⚠️ SOUS' if cond_ma else '✅ AU-DESSUS'}")
 
-    # Fallback si régime non entraîné
     if regime not in resultats:
-        regime = "CALME_TENDANCE" if "CALME_TENDANCE" in resultats else list(resultats.keys())[0]
-        print(f"  → Fallback vers {regime}")
+        fallback = "CALME_TENDANCE" if "CALME_TENDANCE" in resultats \
+                   else list(resultats.keys())[0]
+        print(f"  → Fallback vers {fallback}")
+        regime = fallback
 
     r     = resultats[regime]
     feats = r['feats']
@@ -349,30 +311,24 @@ def signal_du_jour(df, resultats, vol_seuil):
     conf   = CONFIANCE.get(regime, CONFIANCE["CALME_LATERAL"])
     signal = "ACHAT"  if proba >= conf['achat'] else \
              "VENTE"  if proba <= conf['vente'] else "NEUTRE"
-    emoji  = "🟢" if signal == "ACHAT" else \
-             ("🔴" if signal == "VENTE" else "🟡")
-
-    niveau_conf = "HAUTE" if abs(proba - 0.5) > 0.20 else \
-                  "MOYENNE" if abs(proba - 0.5) > 0.12 else "FAIBLE"
+    emoji  = "🟢" if signal == "ACHAT" else ("🔴" if signal == "VENTE" else "🟡")
+    dist   = abs(proba - 0.5)
+    niveau = "HAUTE" if dist > 0.20 else "MOYENNE" if dist > 0.12 else "FAIBLE"
 
     print(f"\n  P(hausse 5j) = {proba*100:.1f}%  |  Seuil = {seuil:.2f}")
-    print(f"  Confiance    = {niveau_conf}")
+    print(f"  Confiance    = {niveau}")
     print(f"  ┌──────────────────────────────────┐")
     print(f"  │  SIGNAL → {emoji}  {signal:<10}           │")
     print(f"  │  Modèle : {regime:<25}│")
-    print(f"  │  Confiance : {niveau_conf:<22}│")
+    print(f"  │  Confiance : {niveau:<22}│")
     print(f"  └──────────────────────────────────┘")
 
-    if niveau_conf == "FAIBLE":
+    if niveau == "FAIBLE":
         print(f"\n  ⚠️  Confiance faible → prudence recommandée")
-        print(f"     Le modèle {regime} a une AUC ~0.54")
-        print(f"     Attends une proba < {conf['vente']:.2f} ou > {conf['achat']:.2f}")
+        print(f"     Attends proba < {conf['vente']:.2f} ou > {conf['achat']:.2f}")
 
     return signal, proba, regime
 
-# ─────────────────────────────────────────
-# PIPELINE PRINCIPAL
-# ─────────────────────────────────────────
 if __name__ == "__main__":
     print("=" * 55)
     print("  MODULE 2 — 3 RÉGIMES + ZONES DE CONFIANCE")
@@ -385,14 +341,14 @@ if __name__ == "__main__":
     regime, vol_seuil = detecter_regime_affine(df)
     df['regime'] = regime.values
 
-    # Stats par régime
     print("\n" + "=" * 55)
     print("  STATISTIQUES PAR RÉGIME")
     print("=" * 55)
     noms_reg = {0: "CALME_LATERAL", 1: "CALME_TENDANCE", 2: "STRESSE"}
     for code, nom in noms_reg.items():
         sub = df[df['regime'] == code]
-        if len(sub) == 0: continue
+        if len(sub) == 0:
+            continue
         print(f"\n  {nom} ({len(sub)}j) :")
         print(f"    % hausse 5j : {sub['target'].mean()*100:.1f}%")
         print(f"    Vol moy     : {sub['vol_20d'].mean()*100:.2f}%")
@@ -437,15 +393,20 @@ if __name__ == "__main__":
             joblib.dump(scaler, f"models/scaler_{nom.lower()}.pkl")
             joblib.dump(seuil,  f"models/seuil_{nom.lower()}.pkl")
             joblib.dump(cols,   f"models/feats_{nom.lower()}.pkl")
-            resultats[nom] = {'ensemble': ens,    'scaler': scaler,
-                               'seuil':    seuil,  'feats':  cols}
+            resultats[nom] = {
+                'ensemble': ens,
+                'scaler':   scaler,
+                'seuil':    seuil,
+                'feats':    cols,
+            }
             print(f"  → {nom} sauvegardé ✓")
 
-    joblib.dump({'vix_seuil':      VIX_SEUIL,
-                  'vol_percentile': VOL_PERCENTILE,
-                  'vol_seuil':      vol_seuil,
-                  'confiance':      CONFIANCE},
-                "models/regime_params.pkl")
+    joblib.dump({
+        'vix_seuil':      VIX_SEUIL,
+        'vol_percentile': VOL_PERCENTILE,
+        'vol_seuil':      vol_seuil,
+        'confiance':      CONFIANCE,
+    }, "models/regime_params.pkl")
 
     signal_du_jour(df, resultats, vol_seuil)
     print("\nModule 2 terminé ✓")

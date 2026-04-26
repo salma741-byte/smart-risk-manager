@@ -13,7 +13,7 @@ DB_PATH = "data/market_data.db"
 actifs = {
     'sp500': '^GSPC',
     'vix'  : '^VIX',
-    'btc'  : 'BTC-USD'
+    
 }
 
 def get_connection():
@@ -74,8 +74,12 @@ def creer_tables():
 def telecharger_et_stocker(nom, ticker):
     print(f"\nTéléchargement de {nom} ({ticker})...")
 
-    raw = yf.download(ticker, start="2018-01-01", progress=False)
+   # ── DAILY (long terme → modèle principal)
+    raw = yf.download(ticker, start="2000-01-01", interval='1d', progress=False)
 
+# ── INTRADAY (optionnel pour futur)
+    raw_1h = yf.download(ticker, period='730d', interval='1h', progress=False)
+    raw_15min = yf.download(ticker, period='60d', interval='15m', progress=False)
     if isinstance(raw.columns, pd.MultiIndex):
         raw.columns = raw.columns.get_level_values(0)
 

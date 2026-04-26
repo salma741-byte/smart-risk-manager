@@ -339,8 +339,23 @@ def construire_features_completes():
     df = ajouter_features_macro(df)
 
     # ── Cible J+5 (+0.5% minimum) ───────────────────────────────
-    df['target'] = (df['close'].shift(-5) > df['close'] * 1.005).astype(int)
+    # Création du target basé sur mouvement significatif
+    df['return_5j'] = df['close'].pct_change(5).shift(-5)
+    df['target'] = np.nan
 
+    df.loc[df['return_5j'] > 0.01,  'target'] = 1   # hausse forte
+    df.loc[df['return_5j'] < -0.01, 'target'] = 0   # baisse forte
+
+# Supprimer les cas neutres (bruit)
+# Remplacer les inf
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
+
+# Remplir intelligemment
+    df = df.ffill().bfill()
+
+
+# Supprimer seulement les lignes sans target
+    df = df.dropna(subset=['target'])
     # Nettoyage
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
     df.dropna(inplace=True)
