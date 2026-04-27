@@ -347,19 +347,10 @@ def construire_features_completes():
     df.loc[df['return_5j'] < -0.01, 'target'] = 0   # baisse forte
 
 # Supprimer les cas neutres (bruit)
-# Remplacer les inf
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
-
-# Remplir intelligemment
-    df = df.ffill().bfill()
-
-
-# Supprimer seulement les lignes sans target
+    df = df.ffill()          # jamais bfill sur features
     df = df.dropna(subset=['target'])
-    # Nettoyage
-    df.replace([np.inf, -np.inf], np.nan, inplace=True)
     df.dropna(inplace=True)
-    df = df[df.index.weekday < 5]
 
     print(f"\n  Dataset final : {len(df)} lignes, {df.shape[1]} colonnes")
     print(f"  Balance cible : {df['target'].mean()*100:.1f}% hausse sur 5j")

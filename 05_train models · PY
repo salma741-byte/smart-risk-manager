@@ -36,10 +36,12 @@ VOL_PERCENTILE = 60
 N_TRIALS       = 50
 
 CONFIANCE = {
-    "STRESSE":        {'achat': 0.58, 'vente': 0.42},
-    "CALME_TENDANCE": {'achat': 0.60, 'vente': 0.40},
-    "CALME_LATERAL":  {'achat': 0.62, 'vente': 0.38},
+    "STRESSE":        {'achat': 0.68, 'vente': 0.32},
+    "CALME_TENDANCE": {'achat': 0.70, 'vente': 0.30},
+    "CALME_LATERAL":  {'achat': 0.75, 'vente': 0.25},
 }
+
+
 
 def charger_dataset():
     conn = sqlite3.connect(DB_PATH)
@@ -174,7 +176,6 @@ PARAMS_DEFAUT = {
                            min_child_weight=45, gamma=0.4,
                            reg_alpha=0.5, reg_lambda=5.0),
 }
-
 def entrainer_modele(X_train, y_train, X_test, y_test, nom, feat_cols):
     print(f"\n  {'─'*50}")
     print(f"  Régime : {nom}")
@@ -196,38 +197,52 @@ def entrainer_modele(X_train, y_train, X_test, y_test, nom, feat_cols):
     best_p = optimiser_xgb(X_tr_s, y_train) or PARAMS_DEFAUT.get(
         nom, PARAMS_DEFAUT["CALME_TENDANCE"])
 
-    # XGBoost + calibration
+    # ───────── XGBoost ─────────
     xgb_base = xgb.XGBClassifier(
-        **best_p, scale_pos_weight=sp,
-        eval_metric='auc', use_label_encoder=False,
-        random_state=42, n_jobs=-1
+        **best_p,
+        scale_pos_weight=sp,
+        eval_metric='auc',
+        use_label_encoder=False,
+        random_state=42,
+        n_jobs=-1
     )
     xgb_base.fit(X_tr_s, y_train, sample_weight=sw, verbose=False)
 
-    xgb_m = CalibratedClassifierCV(xgb_base, method='isotonic', cv=3)
+    # ✅ Calibration TIME SERIES SAFE
+    tscv = TimeSeriesSplit(n_splits=3)
+    xgb_m = CalibratedClassifierCV(xgb_base, method='isotonic', cv=tscv)
     xgb_m.fit(X_tr_s, y_train)
 
-    # Random Forest
+    # ───────── Random Forest ─────────
     rf_m = RandomForestClassifier(
         n_estimators=400,
         max_depth=best_p.get('max_depth', 3),
         min_samples_leaf=20,
         max_features='sqrt',
         class_weight='balanced',
-        random_state=42, n_jobs=-1
+        random_state=42,
+        n_jobs=-1
     )
     rf_m.fit(X_tr_s, y_train)
 
-    # Probas & poids dynamiques
-    p_xgb   = xgb_m.predict_proba(X_te_s)[:, 1]
-    p_rf    = rf_m.predict_proba(X_te_s)[:, 1]
+    # ───────── Probabilités ─────────
+    p_xgb = xgb_m.predict_proba(X_te_s)[:, 1]
+    p_rf  = rf_m.predict_proba(X_te_s)[:, 1]
+
     auc_xgb = roc_auc_score(y_test, p_xgb)
     auc_rf  = roc_auc_score(y_test, p_rf)
-    w_xgb   = auc_xgb / (auc_xgb + auc_rf)
-    w_rf    = auc_rf  / (auc_xgb + auc_rf)
+
+    # ✅ sécurisation poids
+    total_auc = auc_xgb + auc_rf
+    if total_auc == 0:
+        w_xgb, w_rf = 0.5, 0.5
+    else:
+        w_xgb = auc_xgb / total_auc
+        w_rf  = auc_rf  / total_auc
 
     probas_ens = w_xgb * p_xgb + w_rf * p_rf
     auc_ens    = roc_auc_score(y_test, probas_ens)
+
     print(f"  AUC XGB={auc_xgb:.4f} | RF={auc_rf:.4f} | "
           f"Ensemble={auc_ens:.4f} (w_xgb={w_xgb:.2f})")
 
@@ -237,32 +252,33 @@ def entrainer_modele(X_train, y_train, X_test, y_test, nom, feat_cols):
 
     print(f"  Seuil={seuil:.2f} | Accuracy={acc:.4f} | AUC={auc_ens:.4f}")
     print(classification_report(y_test, preds,
-                                  target_names=['Baisse', 'Hausse'],
-                                  zero_division=0))
+          target_names=['Baisse', 'Hausse'], zero_division=0))
     print("  Confusion :")
     print(confusion_matrix(y_test, preds))
 
+    # ───────── Confiance ─────────
     conf_achat = CONFIANCE.get(nom, CONFIANCE["CALME_LATERAL"])['achat']
     conf_vente = CONFIANCE.get(nom, CONFIANCE["CALME_LATERAL"])['vente']
-    n_achat    = (probas_corr >= conf_achat).sum()
-    n_vente    = (probas_corr <= conf_vente).sum()
-    n_neutre   = len(probas_corr) - n_achat - n_vente
-    print(f"\n  Distribution signaux (seuils {conf_vente:.2f}/{conf_achat:.2f}) :")
-    print(f"    🟢 ACHAT  : {n_achat}  ({n_achat/len(probas_corr)*100:.1f}%)")
-    print(f"    🟡 NEUTRE : {n_neutre} ({n_neutre/len(probas_corr)*100:.1f}%)")
-    print(f"    🔴 VENTE  : {n_vente}  ({n_vente/len(probas_corr)*100:.1f}%)")
 
     masque = (probas_corr >= conf_achat) | (probas_corr <= conf_vente)
     if masque.sum() > 0:
         acc_conf = accuracy_score(y_test[masque], preds[masque])
         print(f"  Accuracy signaux confiants : {acc_conf:.4f} (n={masque.sum()})")
 
-    imp = pd.Series(xgb_base.feature_importances_, index=feat_cols)
-    print("\n  Top 6 features :")
-    for fname, fval in imp.nlargest(6).items():
-        print(f"    {fname:<32} {fval:.4f}")
+    # ───────── Feature importance ─────────
+    if hasattr(xgb_base, "feature_importances_"):
+        imp = pd.Series(xgb_base.feature_importances_, index=feat_cols)
+        print("\n  Top 6 features :")
+        for fname, fval in imp.nlargest(6).items():
+            print(f"    {fname:<32} {fval:.4f}")
 
-    ensemble = {'xgb': xgb_m, 'rf': rf_m, 'w_xgb': w_xgb, 'w_rf': w_rf}
+    ensemble = {
+        'xgb': xgb_m,
+        'rf': rf_m,
+        'w_xgb': w_xgb,
+        'w_rf': w_rf
+    }
+
     return ensemble, scaler, probas_corr, seuil
 
 def predire(ensemble, scaler, X_raw):

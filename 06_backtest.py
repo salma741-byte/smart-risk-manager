@@ -131,34 +131,46 @@ def predire_historique(df, modeles, params):
 # 4. SIMULATION BACKTEST
 # ─────────────────────────────────────────
 def simuler_backtest(df, frais=0.001):
-    """
-    Stratégie long-only :
-    - ACHAT  → position 1 (investi)
-    - VENTE  → position -1 (short léger, 50%)
-    - NEUTRE → position 0 (cash)
-    Frais : 0.1% par transaction
-    """
     bt = df.copy()
     bt['ret_daily'] = bt['close'].pct_change()
 
-    # Position décalée de 1 jour (on agit le lendemain du signal)
-    bt['position'] = bt['signal'].shift(1).map(
-        {'ACHAT': 1.0, 'NEUTRE': 0.0, 'VENTE': -0.5}
-    ).fillna(0)
+    positions = []
+    for i in range(len(bt)):
+        row    = bt.iloc[i]
+        signal = row.get('signal', 'NEUTRE')
 
-    # Frais sur changement de position
+        # Long-only de base
+        if signal == 'ACHAT':
+            pos = 1.0
+        else:
+            pos = 0.0
+
+        # Filtre MA200 : pas d'achat sous la MA200
+        if row.get('close', 0) < row.get('ma_200', 0):
+            pos = 0.0
+
+        # Surcharge SR : breakout fort → achat confirmé
+        if row.get('signal_breakout_sr', 0) == 1 and row.get('vol_franchissement', 1) >= 2.0:
+            pos = 1.0
+
+        # Surcharge SR : breakdown fort → sortie immédiate
+        if row.get('signal_breakdown_sr', 0) == 1 and row.get('vol_franchissement', 1) >= 2.0:
+            pos = 0.0
+
+        # Proche résistance forte → réduire position
+        if row.get('proche_resistance', 0) == 1 and row.get('score_resistance', 0) >= 50:
+            pos = pos * 0.5  # moitié position
+
+        positions.append(pos)
+
+    bt['position'] = pd.Series(positions, index=bt.index).shift(1).fillna(0)
     bt['pos_change'] = bt['position'].diff().abs()
     bt['frais_app']  = bt['pos_change'] * frais
-
-    # Rendement stratégie
-    bt['ret_strat'] = bt['position'] * bt['ret_daily'] - bt['frais_app']
-
-    # Cumul
-    bt['cum_bh']    = (1 + bt['ret_daily']).cumprod()
-    bt['cum_strat'] = (1 + bt['ret_strat']).cumprod()
+    bt['ret_strat']  = bt['position'] * bt['ret_daily'] - bt['frais_app']
+    bt['cum_bh']     = (1 + bt['ret_daily']).cumprod()
+    bt['cum_strat']  = (1 + bt['ret_strat']).cumprod()
 
     return bt.dropna()
-
 # ─────────────────────────────────────────
 # 5. MÉTRIQUES FINANCIÈRES
 # ─────────────────────────────────────────
