@@ -379,3 +379,29 @@ if __name__ == "__main__":
     os.makedirs("models", exist_ok=True)
     df = construire_features_completes()
     print("\nRelance : python 2_train_models_FINAL.py")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,6 +1,9 @@
 # ============================================================
-#  2_train_models_FINAL_V3.py — VERSION CORRIGÉE
-#  3 Régimes + Zones de confiance + Optuna + Ensemble calibré
+#  2_train_extreme.py — MODÈLE MOUVEMENTS EXTRÊMES
+#  Prédit séparément :
+#    - FORTE HAUSSE (> +1.5% sur 5j)
+#    - FORTE BAISSE (< -1.5% sur 5j)
+#  Ne trade que quand le modèle est très confiant
 # ============================================================
 
 import pandas as pd
@@ -15,7 +18,9 @@ from sklearn.preprocessing      import StandardScaler
 from sklearn.calibration        import CalibratedClassifierCV
 from sklearn.ensemble           import RandomForestClassifier
 from sklearn.metrics            import (accuracy_score, classification_report,
-                                         roc_auc_score, f1_score, confusion_matrix)
+                                         roc_auc_score, f1_score,
+                                         confusion_matrix, precision_score,
+                                         recall_score)
 from sklearn.utils.class_weight import compute_class_weight
 from sklearn.model_selection    import TimeSeriesSplit
 import xgboost as xgb
@@ -27,60 +32,32 @@ try:
     print("✓ Optuna disponible")
 except ImportError:
     OPTUNA_OK = False
-    print("⚠️  pip install optuna  pour l'optimisation automatique")
 
 os.makedirs("models", exist_ok=True)
-DB_PATH        = "data/market_data.db"
-VIX_SEUIL      = 20.0
-VOL_PERCENTILE = 60
-N_TRIALS       = 50
+DB_PATH  = "data/market_data.db"
+N_TRIALS = 60
 
-CONFIANCE = {
-    "STRESSE":        {'achat': 0.68, 'vente': 0.32},
-    "CALME_TENDANCE": {'achat': 0.70, 'vente': 0.30},
-    "CALME_LATERAL":  {'achat': 0.75, 'vente': 0.25},
-}
+# Seuils de confiance — on ne trade que si très sûr
+SEUIL_ACHAT = 0.55   # P(forte hausse) > 55%
+SEUIL_VENTE = 0.55   # P(forte baisse) > 55%
 
-
-
+# ─────────────────────────────────────────
+# 1. CHARGEMENT
+# ─────────────────────────────────────────
 def charger_dataset():
-    conn = sqlite3.connect(DB_PATH)
-    df   = pd.read_sql("SELECT * FROM sp500_ml_features",
-                        conn, index_col='date', parse_dates=['date'])
-    fc   = pd.read_sql("SELECT feature FROM features_calme",
-                        conn)['feature'].tolist()
-    fs   = pd.read_sql("SELECT feature FROM features_stresse",
-                        conn)['feature'].tolist()
+    conn  = sqlite3.connect(DB_PATH)
+    df    = pd.read_sql("SELECT * FROM sp500_extreme_features",
+                         conn, index_col='date', parse_dates=['date'])
+    feats = pd.read_sql("SELECT feature FROM features_extremes",
+                         conn)['feature'].tolist()
     conn.close()
     df.sort_index(inplace=True)
-    return df, fc, fs
+    feats = [f for f in feats if f in df.columns]
+    return df, feats
 
-def detecter_regime_affine(df):
-    vol_seuil  = df['vol_20d'].quantile(VOL_PERCENTILE / 100)
-    cond_vix   = (df['vix_close'] > VIX_SEUIL).astype(int)
-    cond_vol   = (df['vol_20d']   > vol_seuil).astype(int)
-    cond_ma    = (df['close']     < df['ma_200']).astype(int)
-    est_stress = ((cond_vix + cond_vol + cond_ma) >= 2)
-
-    if 'adx_14' in df.columns:
-        est_tendance = (~est_stress) & (df['adx_14'] > 20)
-    else:
-        ma_pente     = df['close'].rolling(20).mean().pct_change(5).abs()
-        est_tendance = (~est_stress) & (ma_pente > ma_pente.quantile(0.40))
-
-    regime = pd.Series(0, index=df.index)
-    regime[est_tendance] = 1
-    regime[est_stress]   = 2
-
-    n_lat  = (regime == 0).sum()
-    n_tend = (regime == 1).sum()
-    n_str  = (regime == 2).sum()
-    n_tot  = len(regime)
-    print(f"  STRESSÉ        : {n_str}j ({n_str/n_tot*100:.1f}%)")
-    print(f"  CALME_TENDANCE : {n_tend}j ({n_tend/n_tot*100:.1f}%)")
-    print(f"  CALME_LATERAL  : {n_lat}j ({n_lat/n_tot*100:.1f}%)")
-    return regime, vol_seuil
-
+# ─────────────────────────────────────────
+# 2. NETTOYAGE
+# ─────────────────────────────────────────
 def preparer_X(df, feat_cols):
     cols = [c for c in feat_cols if c in df.columns]
     X    = df[cols].copy()
@@ -88,341 +65,288 @@ def preparer_X(df, feat_cols):
     for col in X.columns:
         if X[col].isna().any():
             X[col].fillna(X[col].median(), inplace=True)
-        q_low  = X[col].quantile(0.01)
-        q_high = X[col].quantile(0.99)
-        X[col] = X[col].clip(q_low, q_high)
+        q1, q99 = X[col].quantile(0.01), X[col].quantile(0.99)
+        X[col]  = X[col].clip(q1, q99)
     return X.values, cols
 
-def trouver_seuil_optimal(y_true, probas):
-    auc = roc_auc_score(y_true, probas)
-    if auc < 0.50:
-        probas = 1 - probas
-        print("    ⚠️  Signal inversé → flip probas")
-    meilleur_seuil, meilleur_f1 = 0.5, 0.0
-    for seuil in np.arange(0.25, 0.76, 0.01):
-        preds = (probas >= seuil).astype(int)
-        if len(np.unique(preds)) < 2:
-            continue
-        f1 = f1_score(y_true, preds, average='macro')
-        if f1 > meilleur_f1:
-            meilleur_f1    = f1
-            meilleur_seuil = seuil
-    return meilleur_seuil, probas
-
-def optimiser_xgb(X_train, y_train, n_trials=N_TRIALS):
+# ─────────────────────────────────────────
+# 3. OPTUNA
+# ─────────────────────────────────────────
+def optimiser(X_tr, y_tr, n_trials=N_TRIALS):
     if not OPTUNA_OK:
         return None
     print(f"  Optuna : {n_trials} essais...")
-    tscv = TimeSeriesSplit(n_splits=4)
-    cw   = compute_class_weight('balanced', classes=np.array([0, 1]), y=y_train)
-    sw   = np.where(y_train == 1, cw[1], cw[0])
+    tscv = TimeSeriesSplit(n_splits=5)
+    cw   = compute_class_weight('balanced', classes=np.array([0,1]), y=y_tr)
+    sw   = np.where(y_tr==1, cw[1], cw[0])
 
-    def objective(trial):
+    def obj(trial):
         p = {
-            'n_estimators':     trial.suggest_int('n_estimators', 100, 600),
-            'max_depth':        trial.suggest_int('max_depth', 2, 6),
+            'n_estimators':     trial.suggest_int('n', 200, 800),
+            'max_depth':        trial.suggest_int('d', 2, 7),
             'learning_rate':    trial.suggest_float('lr', 0.005, 0.15, log=True),
-            'subsample':        trial.suggest_float('sub', 0.5, 0.95),
-            'colsample_bytree': trial.suggest_float('col', 0.5, 0.95),
-            'min_child_weight': trial.suggest_int('mcw', 5, 50),
-            'gamma':            trial.suggest_float('gam', 0.0, 0.5),
-            'reg_alpha':        trial.suggest_float('alp', 0.0, 1.0),
-            'reg_lambda':       trial.suggest_float('lam', 0.5, 3.0),
+            'subsample':        trial.suggest_float('ss', 0.5, 0.95),
+            'colsample_bytree': trial.suggest_float('cs', 0.5, 0.95),
+            'min_child_weight': trial.suggest_int('mcw', 5, 60),
+            'gamma':            trial.suggest_float('g', 0, 0.5),
+            'reg_alpha':        trial.suggest_float('a', 0, 1),
+            'reg_lambda':       trial.suggest_float('l', 0.5, 3),
         }
-        sp = max(0.5, (y_train == 0).sum() / max(1, (y_train == 1).sum()))
+        sp = max(0.3, (y_tr==0).sum()/max(1,(y_tr==1).sum()))
         scores = []
-        for tr_i, va_i in tscv.split(X_train):
-            if len(np.unique(y_train[va_i])) < 2:
+        for tr_i, va_i in tscv.split(X_tr):
+            if len(np.unique(y_tr[va_i])) < 2:
                 continue
             sc  = StandardScaler()
-            Xtr = np.nan_to_num(sc.fit_transform(X_train[tr_i]))
-            Xva = np.nan_to_num(sc.transform(X_train[va_i]))
+            Xtr = np.nan_to_num(sc.fit_transform(X_tr[tr_i]))
+            Xva = np.nan_to_num(sc.transform(X_tr[va_i]))
             m   = xgb.XGBClassifier(**p, scale_pos_weight=sp,
                                      eval_metric='auc',
                                      use_label_encoder=False,
                                      random_state=42, n_jobs=-1, verbosity=0)
-            m.fit(Xtr, y_train[tr_i], sample_weight=sw[tr_i], verbose=False)
-            scores.append(roc_auc_score(y_train[va_i],
-                                         m.predict_proba(Xva)[:, 1]))
+            m.fit(Xtr, y_tr[tr_i], sample_weight=sw[tr_i], verbose=False)
+            scores.append(roc_auc_score(y_tr[va_i], m.predict_proba(Xva)[:,1]))
         return np.mean(scores) if scores else 0.5
 
     study = optuna.create_study(direction='maximize',
                                  sampler=optuna.samplers.TPESampler(seed=42))
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    study.optimize(obj, n_trials=n_trials, show_progress_bar=False)
     bp = study.best_params
+    print(f"  Meilleure AUC CV : {study.best_value:.4f}")
     return {
-        'n_estimators':     bp['n_estimators'],
-        'max_depth':        bp['max_depth'],
+        'n_estimators':     bp['n'],
+        'max_depth':        bp['d'],
         'learning_rate':    bp['lr'],
-        'subsample':        bp['sub'],
-        'colsample_bytree': bp['col'],
+        'subsample':        bp['ss'],
+        'colsample_bytree': bp['cs'],
         'min_child_weight': bp['mcw'],
-        'gamma':            bp['gam'],
-        'reg_alpha':        bp['alp'],
-        'reg_lambda':       bp['lam'],
+        'gamma':            bp['g'],
+        'reg_alpha':        bp['a'],
+        'reg_lambda':       bp['l'],
     }
 
-PARAMS_DEFAUT = {
-    "STRESSE": dict(n_estimators=300, max_depth=3, learning_rate=0.02,
-                    subsample=0.65, colsample_bytree=0.65,
-                    min_child_weight=20, gamma=0.3,
-                    reg_alpha=0.3, reg_lambda=2.0),
-    "CALME_TENDANCE": dict(n_estimators=400, max_depth=4, learning_rate=0.03,
-                            subsample=0.75, colsample_bytree=0.75,
-                            min_child_weight=15, gamma=0.15,
-                            reg_alpha=0.15, reg_lambda=1.5),
-    "CALME_LATERAL": dict(n_estimators=100, max_depth=1, learning_rate=0.01,
-                           subsample=0.60, colsample_bytree=0.60,
-                           min_child_weight=45, gamma=0.4,
-                           reg_alpha=0.5, reg_lambda=5.0),
-}
-def entrainer_modele(X_train, y_train, X_test, y_test, nom, feat_cols):
+# ─────────────────────────────────────────
+# 4. ENTRAÎNEMENT UN MODÈLE
+# ─────────────────────────────────────────
+def entrainer_modele(X_tr, y_tr, X_te, y_te, feat_cols, nom):
     print(f"\n  {'─'*50}")
-    print(f"  Régime : {nom}")
-    print(f"  Train : {len(X_train)}j  |  Test : {len(X_test)}j")
-    print(f"  Balance : {y_train.mean():.2%} hausse")
-
-    if len(X_train) < 50:
-        print("  ⚠️  Pas assez de données")
-        return None, None, None, 0.5
+    print(f"  Modèle : {nom}")
+    print(f"  Train : {len(X_tr)}j | Test : {len(X_te)}j")
+    print(f"  Positifs train : {y_tr.mean()*100:.1f}% | test : {y_te.mean()*100:.1f}%")
 
     scaler = StandardScaler()
-    X_tr_s = np.nan_to_num(scaler.fit_transform(X_train))
-    X_te_s = np.nan_to_num(scaler.transform(X_test))
+    X_tr_s = np.nan_to_num(scaler.fit_transform(X_tr))
+    X_te_s = np.nan_to_num(scaler.transform(X_te))
 
-    sp = max(0.5, (y_train == 0).sum() / max(1, (y_train == 1).sum()))
-    cw = compute_class_weight('balanced', classes=np.array([0, 1]), y=y_train)
-    sw = np.where(y_train == 1, cw[1], cw[0])
+    sp = max(0.3, (y_tr==0).sum() / max(1,(y_tr==1).sum()))
+    cw = compute_class_weight('balanced', classes=np.array([0,1]), y=y_tr)
+    sw = np.where(y_tr==1, cw[1], cw[0])
 
-    best_p = optimiser_xgb(X_tr_s, y_train) or PARAMS_DEFAUT.get(
-        nom, PARAMS_DEFAUT["CALME_TENDANCE"])
-
-    # ───────── XGBoost ─────────
-    xgb_base = xgb.XGBClassifier(
-        **best_p,
-        scale_pos_weight=sp,
-        eval_metric='auc',
-        use_label_encoder=False,
-        random_state=42,
-        n_jobs=-1
-    )
-    xgb_base.fit(X_tr_s, y_train, sample_weight=sw, verbose=False)
-
-    # ✅ Calibration TIME SERIES SAFE
-    tscv = TimeSeriesSplit(n_splits=3)
-    xgb_m = CalibratedClassifierCV(xgb_base, method='isotonic', cv=tscv)
-    xgb_m.fit(X_tr_s, y_train)
-
-    # ───────── Random Forest ─────────
-    rf_m = RandomForestClassifier(
-        n_estimators=400,
-        max_depth=best_p.get('max_depth', 3),
-        min_samples_leaf=20,
-        max_features='sqrt',
-        class_weight='balanced',
-        random_state=42,
-        n_jobs=-1
-    )
-    rf_m.fit(X_tr_s, y_train)
-
-    # ───────── Probabilités ─────────
-    p_xgb = xgb_m.predict_proba(X_te_s)[:, 1]
-    p_rf  = rf_m.predict_proba(X_te_s)[:, 1]
-
-    auc_xgb = roc_auc_score(y_test, p_xgb)
-    auc_rf  = roc_auc_score(y_test, p_rf)
-
-    # ✅ sécurisation poids
-    total_auc = auc_xgb + auc_rf
-    if total_auc == 0:
-        w_xgb, w_rf = 0.5, 0.5
-    else:
-        w_xgb = auc_xgb / total_auc
-        w_rf  = auc_rf  / total_auc
-
-    probas_ens = w_xgb * p_xgb + w_rf * p_rf
-    auc_ens    = roc_auc_score(y_test, probas_ens)
-
-    print(f"  AUC XGB={auc_xgb:.4f} | RF={auc_rf:.4f} | "
-          f"Ensemble={auc_ens:.4f} (w_xgb={w_xgb:.2f})")
-
-    seuil, probas_corr = trouver_seuil_optimal(y_test, probas_ens)
-    preds = (probas_corr >= seuil).astype(int)
-    acc   = accuracy_score(y_test, preds)
-
-    print(f"  Seuil={seuil:.2f} | Accuracy={acc:.4f} | AUC={auc_ens:.4f}")
-    print(classification_report(y_test, preds,
-          target_names=['Baisse', 'Hausse'], zero_division=0))
-    print("  Confusion :")
-    print(confusion_matrix(y_test, preds))
-
-    # ───────── Confiance ─────────
-    conf_achat = CONFIANCE.get(nom, CONFIANCE["CALME_LATERAL"])['achat']
-    conf_vente = CONFIANCE.get(nom, CONFIANCE["CALME_LATERAL"])['vente']
-
-    masque = (probas_corr >= conf_achat) | (probas_corr <= conf_vente)
-    if masque.sum() > 0:
-        acc_conf = accuracy_score(y_test[masque], preds[masque])
-        print(f"  Accuracy signaux confiants : {acc_conf:.4f} (n={masque.sum()})")
-
-    # ───────── Feature importance ─────────
-    if hasattr(xgb_base, "feature_importances_"):
-        imp = pd.Series(xgb_base.feature_importances_, index=feat_cols)
-        print("\n  Top 6 features :")
-        for fname, fval in imp.nlargest(6).items():
-            print(f"    {fname:<32} {fval:.4f}")
-
-    ensemble = {
-        'xgb': xgb_m,
-        'rf': rf_m,
-        'w_xgb': w_xgb,
-        'w_rf': w_rf
+    # Optuna
+    best_p = optimiser(X_tr_s, y_tr) or {
+        'n_estimators': 400, 'max_depth': 4, 'learning_rate': 0.03,
+        'subsample': 0.75, 'colsample_bytree': 0.75,
+        'min_child_weight': 15, 'gamma': 0.1,
+        'reg_alpha': 0.1, 'reg_lambda': 1.0,
     }
 
-    return ensemble, scaler, probas_corr, seuil
+    # XGBoost
+    xgb_base = xgb.XGBClassifier(
+        **best_p, scale_pos_weight=sp,
+        eval_metric='auc', use_label_encoder=False,
+        random_state=42, n_jobs=-1
+    )
+    xgb_base.fit(X_tr_s, y_tr, sample_weight=sw, verbose=False)
 
-def predire(ensemble, scaler, X_raw):
-    X_s   = np.nan_to_num(scaler.transform(X_raw))
-    p_xgb = ensemble['xgb'].predict_proba(X_s)[:, 1]
-    p_rf  = ensemble['rf'].predict_proba(X_s)[:, 1]
-    return ensemble['w_xgb'] * p_xgb + ensemble['w_rf'] * p_rf
+    tscv  = TimeSeriesSplit(n_splits=3)
+    xgb_m = CalibratedClassifierCV(xgb_base, method='isotonic', cv=tscv)
+    xgb_m.fit(X_tr_s, y_tr)
 
-def signal_du_jour(df, resultats, vol_seuil):
+    # Random Forest
+    rf_m = RandomForestClassifier(
+        n_estimators=500, max_depth=best_p['max_depth'],
+        min_samples_leaf=15, max_features='sqrt',
+        class_weight='balanced', random_state=42, n_jobs=-1
+    )
+    rf_m.fit(X_tr_s, y_tr)
+
+    # Ensemble pondéré
+    p_xgb   = xgb_m.predict_proba(X_te_s)[:,1]
+    p_rf    = rf_m.predict_proba(X_te_s)[:,1]
+    auc_xgb = roc_auc_score(y_te, p_xgb)
+    auc_rf  = roc_auc_score(y_te, p_rf)
+    tot     = auc_xgb + auc_rf
+    w_xgb   = auc_xgb/tot if tot>0 else 0.5
+    w_rf    = auc_rf/tot  if tot>0 else 0.5
+    probas  = w_xgb*p_xgb + w_rf*p_rf
+    auc_ens = roc_auc_score(y_te, probas)
+
+    print(f"  AUC → XGB:{auc_xgb:.4f} | RF:{auc_rf:.4f} | Ens:{auc_ens:.4f}")
+
+    # Métriques à différents seuils
+    print(f"\n  Analyse par seuil de confiance :")
+    print(f"  {'Seuil':>6} | {'n signaux':>10} | {'Precision':>10} | {'Recall':>8} | {'F1':>6}")
+    print(f"  {'─'*55}")
+    for seuil in [0.45, 0.50, 0.55, 0.60, 0.65, 0.70]:
+        preds_s = (probas >= seuil).astype(int)
+        n_sig   = preds_s.sum()
+        if n_sig == 0:
+            continue
+        prec = precision_score(y_te, preds_s, zero_division=0)
+        rec  = recall_score(y_te, preds_s, zero_division=0)
+        f1   = f1_score(y_te, preds_s, zero_division=0)
+        print(f"  {seuil:>6.2f} | {n_sig:>10} | {prec:>10.4f} | {rec:>8.4f} | {f1:>6.4f}")
+
+    # Seuil optimal F1
+    best_seuil, best_f1 = 0.5, 0.0
+    for s in np.arange(0.40, 0.76, 0.01):
+        preds_s = (probas >= s).astype(int)
+        if len(np.unique(preds_s)) < 2:
+            continue
+        f1 = f1_score(y_te, preds_s, average='macro')
+        if f1 > best_f1:
+            best_f1, best_seuil = f1, s
+
+    preds = (probas >= best_seuil).astype(int)
+    acc   = accuracy_score(y_te, preds)
+    print(f"\n  Seuil optimal : {best_seuil:.2f} | Accuracy : {acc:.4f} | AUC : {auc_ens:.4f}")
+    print(classification_report(y_te, preds,
+                                  target_names=['Non-extrême','Extrême'],
+                                  zero_division=0))
+
+    # Feature importance
+    imp = pd.Series(xgb_base.feature_importances_, index=feat_cols)
+    print("  Top 10 features :")
+    for fname, fval in imp.nlargest(10).items():
+        print(f"    {fname:<35} {fval:.4f}")
+
+    return {
+        'xgb': xgb_m, 'rf': rf_m,
+        'w_xgb': w_xgb, 'w_rf': w_rf,
+        'scaler': scaler, 'seuil': best_seuil,
+        'auc': auc_ens, 'feats': feat_cols
+    }
+
+# ─────────────────────────────────────────
+# 5. SIGNAL DU JOUR
+# ─────────────────────────────────────────
+def signal_du_jour(df, modele_up, modele_down):
     print("\n" + "=" * 55)
-    print("  SIGNAL DU JOUR")
+    print("  SIGNAL DU JOUR — MOUVEMENTS EXTRÊMES")
     print("=" * 55)
 
-    last     = df.iloc[-1]
-    cond_vix = int(last.get('vix_close', 15) > VIX_SEUIL)
-    cond_vol = int(last.get('vol_20d',  0.01) > vol_seuil)
-    cond_ma  = int(last.get('close',     1)   < last.get('ma_200', 1))
-    score    = cond_vix + cond_vol + cond_ma
+    last  = df.iloc[-1]
+    date  = df.index[-1].strftime('%Y-%m-%d')
+    prix  = last['close']
 
-    if score >= 2:
-        regime = "STRESSE"
-    elif last.get('adx_14', 0) > 20:
-        regime = "CALME_TENDANCE"
+    # Proba forte hausse
+    feats_up = modele_up['feats']
+    X_up     = np.array([[last.get(f,0) for f in feats_up]])
+    X_up_s   = np.nan_to_num(modele_up['scaler'].transform(X_up))
+    p_up     = (modele_up['w_xgb'] * modele_up['xgb'].predict_proba(X_up_s)[0,1] +
+                modele_up['w_rf']  * modele_up['rf'].predict_proba(X_up_s)[0,1])
+
+    # Proba forte baisse
+    feats_dn = modele_down['feats']
+    X_dn     = np.array([[last.get(f,0) for f in feats_dn]])
+    X_dn_s   = np.nan_to_num(modele_down['scaler'].transform(X_dn))
+    p_dn     = (modele_down['w_xgb'] * modele_down['xgb'].predict_proba(X_dn_s)[0,1] +
+                modele_down['w_rf']  * modele_down['rf'].predict_proba(X_dn_s)[0,1])
+
+    print(f"  Date  : {date}")
+    print(f"  Prix  : {prix:,.2f} pts")
+    print(f"  VIX   : {last.get('vix_close',0):.1f}")
+    print(f"  ADX   : {last.get('adx_14',0):.1f}")
+    print(f"  RSI14 : {last.get('rsi_14',50):.1f}")
+    print(f"  F&G   : {last.get('fg_index',50):.0f}")
+    print()
+    print(f"  P(FORTE HAUSSE > +1.5% / 5j) = {p_up*100:.1f}%")
+    print(f"  P(FORTE BAISSE < -1.5% / 5j) = {p_dn*100:.1f}%")
+    print()
+
+    # Décision
+    if p_up >= SEUIL_ACHAT and p_up > p_dn:
+        signal = "ACHAT"
+        emoji  = "🟢"
+        detail = f"Forte hausse probable ({p_up*100:.1f}%)"
+    elif p_dn >= SEUIL_VENTE and p_dn > p_up:
+        signal = "VENTE"
+        emoji  = "🔴"
+        detail = f"Forte baisse probable ({p_dn*100:.1f}%)"
     else:
-        regime = "CALME_LATERAL"
+        signal = "NEUTRE"
+        emoji  = "🟡"
+        detail = "Pas de mouvement extrême prévu → rester en CASH"
 
-    print(f"  Date   : {df.index[-1].strftime('%Y-%m-%d')}")
-    print(f"  Régime : {regime}  (score stress {score}/3)")
-    print(f"    VIX={last.get('vix_close', 0):.1f} | "
-          f"Vol={last.get('vol_20d', 0):.4f} | "
-          f"ADX={last.get('adx_14', 0):.1f} | "
-          f"MA200={'⚠️ SOUS' if cond_ma else '✅ AU-DESSUS'}")
+    conf_up = "HAUTE" if p_up > 0.65 else "MOYENNE" if p_up > 0.55 else "FAIBLE"
+    conf_dn = "HAUTE" if p_dn > 0.65 else "MOYENNE" if p_dn > 0.55 else "FAIBLE"
 
-    if regime not in resultats:
-        fallback = "CALME_TENDANCE" if "CALME_TENDANCE" in resultats \
-                   else list(resultats.keys())[0]
-        print(f"  → Fallback vers {fallback}")
-        regime = fallback
+    print(f"  ┌─────────────────────────────────────────┐")
+    print(f"  │  SIGNAL  →  {emoji}  {signal:<8}                  │")
+    print(f"  │  {detail:<41}│")
+    print(f"  │                                         │")
+    print(f"  │  Conf. HAUSSE : {conf_up:<6}  Conf. BAISSE : {conf_dn:<6}│")
+    print(f"  └─────────────────────────────────────────┘")
 
-    r     = resultats[regime]
-    feats = r['feats']
-    X     = np.array([[last.get(f, 0) for f in feats]])
-    proba = predire(r['ensemble'], r['scaler'], X)[0]
-    seuil = r['seuil']
+    if signal == "NEUTRE":
+        print(f"\n  → Aucun mouvement extrême prévu")
+        print(f"     Attends P(hausse) > {SEUIL_ACHAT*100:.0f}% ou P(baisse) > {SEUIL_VENTE*100:.0f}%")
 
-    conf   = CONFIANCE.get(regime, CONFIANCE["CALME_LATERAL"])
-    signal = "ACHAT"  if proba >= conf['achat'] else \
-             "VENTE"  if proba <= conf['vente'] else "NEUTRE"
-    emoji  = "🟢" if signal == "ACHAT" else ("🔴" if signal == "VENTE" else "🟡")
-    dist   = abs(proba - 0.5)
-    niveau = "HAUTE" if dist > 0.20 else "MOYENNE" if dist > 0.12 else "FAIBLE"
+    return signal, p_up, p_dn
 
-    print(f"\n  P(hausse 5j) = {proba*100:.1f}%  |  Seuil = {seuil:.2f}")
-    print(f"  Confiance    = {niveau}")
-    print(f"  ┌──────────────────────────────────┐")
-    print(f"  │  SIGNAL → {emoji}  {signal:<10}           │")
-    print(f"  │  Modèle : {regime:<25}│")
-    print(f"  │  Confiance : {niveau:<22}│")
-    print(f"  └──────────────────────────────────┘")
-
-    if niveau == "FAIBLE":
-        print(f"\n  ⚠️  Confiance faible → prudence recommandée")
-        print(f"     Attends proba < {conf['vente']:.2f} ou > {conf['achat']:.2f}")
-
-    return signal, proba, regime
-
+# ─────────────────────────────────────────
+# PIPELINE
+# ─────────────────────────────────────────
 if __name__ == "__main__":
     print("=" * 55)
-    print("  MODULE 2 — 3 RÉGIMES + ZONES DE CONFIANCE")
+    print("  MODULE 2 — MOUVEMENTS EXTRÊMES S&P500")
     print("=" * 55)
 
-    df, feats_calme, feats_stress = charger_dataset()
+    df, feats = charger_dataset()
     print(f"Dataset : {len(df)}j × {df.shape[1]} colonnes")
 
-    print("\nDétection des régimes...")
-    regime, vol_seuil = detecter_regime_affine(df)
-    df['regime'] = regime.values
+    n_up   = df['target_up'].sum()
+    n_down = df['target_down'].sum()
+    n_neut = len(df) - n_up - n_down
+    print(f"Classes : HAUSSE={n_up} ({n_up/len(df)*100:.1f}%) | "
+          f"BAISSE={n_down} ({n_down/len(df)*100:.1f}%) | "
+          f"NEUTRE={n_neut} ({n_neut/len(df)*100:.1f}%)")
 
-    print("\n" + "=" * 55)
-    print("  STATISTIQUES PAR RÉGIME")
-    print("=" * 55)
-    noms_reg = {0: "CALME_LATERAL", 1: "CALME_TENDANCE", 2: "STRESSE"}
-    for code, nom in noms_reg.items():
-        sub = df[df['regime'] == code]
-        if len(sub) == 0:
-            continue
-        print(f"\n  {nom} ({len(sub)}j) :")
-        print(f"    % hausse 5j : {sub['target'].mean()*100:.1f}%")
-        print(f"    Vol moy     : {sub['vol_20d'].mean()*100:.2f}%")
-        print(f"    VIX moy     : {sub['vix_close'].mean():.1f}")
-
+    # Split temporel 80/20
     split    = int(len(df) * 0.80)
     df_train = df.iloc[:split]
     df_test  = df.iloc[split:]
-    print(f"\nSplit : Train={len(df_train)}j | Test={len(df_test)}j")
+    print(f"Split : Train={len(df_train)}j | Test={len(df_test)}j")
 
+    X_train, cols = preparer_X(df_train, feats)
+    X_test,  _    = preparer_X(df_test,  feats)
+
+    # ── Modèle FORTE HAUSSE ───────────────────────────────────
     print("\n" + "=" * 55)
-    print("  ENTRAÎNEMENT")
+    print("  MODÈLE 1 — FORTE HAUSSE (> +1.5% / 5j)")
     print("=" * 55)
+    y_tr_up = df_train['target_up'].values
+    y_te_up = df_test['target_up'].values
+    mod_up  = entrainer_modele(X_train, y_tr_up, X_test, y_te_up, cols, "FORTE_HAUSSE")
 
-    configs = [
-        ("STRESSE",        2, feats_stress),
-        ("CALME_TENDANCE", 1, feats_calme),
-        ("CALME_LATERAL",  0, feats_calme),
-    ]
+    # ── Modèle FORTE BAISSE ───────────────────────────────────
+    print("\n" + "=" * 55)
+    print("  MODÈLE 2 — FORTE BAISSE (< -1.5% / 5j)")
+    print("=" * 55)
+    y_tr_dn = df_train['target_down'].values
+    y_te_dn = df_test['target_down'].values
+    mod_dn  = entrainer_modele(X_train, y_tr_dn, X_test, y_te_dn, cols, "FORTE_BAISSE")
 
-    resultats = {}
-    for nom, code, feats in configs:
-        train_r = df_train[df_train['regime'] == code]
-        test_r  = df_test[df_test['regime']   == code]
+    # Sauvegarde
+    joblib.dump(mod_up, "models/modele_extreme_hausse.pkl")
+    joblib.dump(mod_dn, "models/modele_extreme_baisse.pkl")
+    joblib.dump({'seuil_achat': SEUIL_ACHAT, 'seuil_vente': SEUIL_VENTE,
+                  'seuil_mouvement': 0.015, 'horizon': 5},
+                "models/extreme_params.pkl")
+    print("\n  Modèles sauvegardés ✓")
 
-        if len(train_r) < 50 or len(test_r) < 10:
-            print(f"\n  ⚠️  {nom} : données insuffisantes "
-                  f"(train={len(train_r)}, test={len(test_r)})")
-            continue
+    # Signal du jour
+    signal_du_jour(df, mod_up, mod_dn)
 
-        X_train, cols = preparer_X(train_r, feats)
-        X_test,  _    = preparer_X(test_r,  feats)
-        y_train = train_r['target'].values
-        y_test  = test_r['target'].values
-
-        ens, scaler, probas, seuil = entrainer_modele(
-            X_train, y_train, X_test, y_test, nom, cols
-        )
-
-        if ens is not None:
-            joblib.dump(ens,    f"models/ensemble_{nom.lower()}.pkl")
-            joblib.dump(scaler, f"models/scaler_{nom.lower()}.pkl")
-            joblib.dump(seuil,  f"models/seuil_{nom.lower()}.pkl")
-            joblib.dump(cols,   f"models/feats_{nom.lower()}.pkl")
-            resultats[nom] = {
-                'ensemble': ens,
-                'scaler':   scaler,
-                'seuil':    seuil,
-                'feats':    cols,
-            }
-            print(f"  → {nom} sauvegardé ✓")
-
-    joblib.dump({
-        'vix_seuil':      VIX_SEUIL,
-        'vol_percentile': VOL_PERCENTILE,
-        'vol_seuil':      vol_seuil,
-        'confiance':      CONFIANCE,
-    }, "models/regime_params.pkl")
-
-    signal_du_jour(df, resultats, vol_seuil)
     print("\nModule 2 terminé ✓")
+    print("Prochaine étape : python 7_backtest.py")
