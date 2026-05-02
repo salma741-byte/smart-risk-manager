@@ -1,8 +1,8 @@
 # ============================================================
-#  7_backtest.py — BACKTEST COMPLET
-#  Teste la stratégie sur données historiques
+#  7_backtest_long_only.py
+#  Stratégie : Long Only sur signaux de FORTE HAUSSE
+#  Règle : P(hausse) > seuil → BUY | Sinon → CASH
 #  Compare vs Buy & Hold
-#  Génère un rapport HTML interactif
 # ============================================================
 
 import pandas as pd
@@ -22,465 +22,363 @@ DB_PATH = "data/market_data.db"
 # ─────────────────────────────────────────
 def charger_donnees():
     conn = sqlite3.connect(DB_PATH)
-    df   = pd.read_sql("SELECT * FROM sp500_ml_features",
+    df   = pd.read_sql("SELECT * FROM sp500_extreme_features",
                         conn, index_col='date', parse_dates=['date'])
     conn.close()
     df.sort_index(inplace=True)
     return df
 
-def charger_modeles():
+def charger_modele_hausse():
     try:
-        params    = joblib.load("models/regime_params.pkl")
-        modeles   = {}
-        for nom in ["stresse", "calme_tendance", "calme_lateral"]:
-            try:
-                modeles[nom] = {
-                    'ensemble': joblib.load(f"models/ensemble_{nom}.pkl"),
-                    'scaler':   joblib.load(f"models/scaler_{nom}.pkl"),
-                    'feats':    joblib.load(f"models/feats_{nom}.pkl"),
-                    'seuil':    joblib.load(f"models/seuil_{nom}.pkl"),
-                }
-            except:
-                pass
-        return modeles, params
+        mod    = joblib.load("models/modele_extreme_hausse.pkl")
+        params = joblib.load("models/extreme_params.pkl")
+        print(f"  ✓ Modèle hausse chargé (AUC={mod.get('auc',0):.4f})")
+        return mod, params
     except Exception as e:
-        print(f"  ⚠️  Modèles non trouvés : {e}")
-        return {}, {}
+        print(f"  ⚠️  Modèle non trouvé : {e}")
+        print("  Lance d'abord : python 2_train_extreme.py")
+        exit()
 
 # ─────────────────────────────────────────
-# 2. DÉTECTION RÉGIME
+# 2. PRÉDICTIONS SUR TOUT L'HISTORIQUE
 # ─────────────────────────────────────────
-def detecter_regime_ligne(row, vol_seuil, vix_seuil=20.0):
-    cond_vix = int(row.get('vix_close', 15) > vix_seuil)
-    cond_vol = int(row.get('vol_20d',  0.01) > vol_seuil)
-    cond_ma  = int(row.get('close', 1) < row.get('ma_200', 1))
-    score    = cond_vix + cond_vol + cond_ma
-    if score >= 2:
-        return "stresse"
-    elif row.get('adx_14', 0) > 20:
-        return "calme_tendance"
-    else:
-        return "calme_lateral"
+def predire_historique(df, mod):
+    feats  = mod['feats']
+    cols   = [f for f in feats if f in df.columns]
+    X      = df[cols].copy()
 
-# ─────────────────────────────────────────
-# 3. PRÉDICTION SUR TOUT L'HISTORIQUE
-# ─────────────────────────────────────────
-def predire_historique(df, modeles, params):
-    vol_seuil  = params.get('vol_seuil', df['vol_20d'].quantile(0.60))
-    vix_seuil  = params.get('vix_seuil', 20.0)
-    confiance  = params.get('confiance', {
-        "STRESSE":        {'achat': 0.58, 'vente': 0.42},
-        "CALME_TENDANCE": {'achat': 0.60, 'vente': 0.40},
-        "CALME_LATERAL":  {'achat': 0.62, 'vente': 0.38},
-    })
+    # Nettoyage
+    X.replace([np.inf, -np.inf], np.nan, inplace=True)
+    for col in X.columns:
+        if X[col].isna().any():
+            X[col].fillna(X[col].median(), inplace=True)
+        q1, q99 = X[col].quantile(0.01), X[col].quantile(0.99)
+        X[col]  = X[col].clip(q1, q99)
 
-    probas  = []
-    signaux = []
-    regimes = []
+    X_s    = np.nan_to_num(mod['scaler'].transform(X.values))
+    p_xgb  = mod['xgb'].predict_proba(X_s)[:, 1]
+    p_rf   = mod['rf'].predict_proba(X_s)[:, 1]
+    probas = mod['w_xgb'] * p_xgb + mod['w_rf'] * p_rf
 
-    print(f"  Calcul des prédictions sur {len(df)} jours...")
-    for i, (date, row) in enumerate(df.iterrows()):
-        regime_key = detecter_regime_ligne(row, vol_seuil, vix_seuil)
-        regimes.append(regime_key.upper())
-
-        if regime_key not in modeles:
-            # Fallback
-            for fallback in ["calme_tendance", "stresse"]:
-                if fallback in modeles:
-                    regime_key = fallback
-                    break
-            else:
-                probas.append(0.5)
-                signaux.append("NEUTRE")
-                continue
-
-        m     = modeles[regime_key]
-        feats = [f for f in m['feats'] if f in df.columns]
-        X     = np.array([[row.get(f, 0) for f in feats]])
-        X     = np.nan_to_num(X)
-
-        try:
-            X_s   = np.nan_to_num(m['scaler'].transform(X))
-            p_xgb = m['ensemble']['xgb'].predict_proba(X_s)[0, 1]
-            p_rf  = m['ensemble']['rf'].predict_proba(X_s)[0, 1]
-            proba = m['ensemble']['w_xgb'] * p_xgb + m['ensemble']['w_rf'] * p_rf
-        except:
-            proba = 0.5
-
-        probas.append(proba)
-
-        regime_upper = regime_key.upper().replace('_TENDANCE','_TENDANCE').replace('_LATERAL','_LATERAL')
-        conf = confiance.get(regime_key.upper().replace('stresse','STRESSE')
-                              .replace('calme_tendance','CALME_TENDANCE')
-                              .replace('calme_lateral','CALME_LATERAL'),
-                              {'achat': 0.60, 'vente': 0.40})
-
-        if proba >= conf['achat']:
-            signaux.append("ACHAT")
-        elif proba <= conf['vente']:
-            signaux.append("VENTE")
-        else:
-            signaux.append("NEUTRE")
-
-    df['proba']   = probas
-    df['signal']  = signaux
-    df['regime']  = regimes
-    return df
+    print(f"  Proba min={probas.min():.3f} | max={probas.max():.3f} | moy={probas.mean():.3f}")
+    return probas
 
 # ─────────────────────────────────────────
-# 4. SIMULATION BACKTEST
+# 3. BACKTEST MULTI-SEUILS
 # ─────────────────────────────────────────
-def simuler_backtest(df, frais=0.001):
-    bt = df.copy()
+def backtest_seuil(df, probas, seuil, frais=0.001):
+    bt = df[['close']].copy()
     bt['ret_daily'] = bt['close'].pct_change()
+    bt['proba']     = probas
 
-    positions = []
-    for i in range(len(bt)):
-        row    = bt.iloc[i]
-        signal = row.get('signal', 'NEUTRE')
+    # Position : 1 si signal, 0 sinon (décalée d'1 jour)
+    bt['position']  = (bt['proba'].shift(1) >= seuil).astype(float)
+    bt['pos_change']= bt['position'].diff().abs().fillna(0)
+    bt['frais_app'] = bt['pos_change'] * frais
+    bt['ret_strat'] = bt['position'] * bt['ret_daily'] - bt['frais_app']
 
-        # Long-only de base
-        if signal == 'ACHAT':
-            pos = 1.0
-        else:
-            pos = 0.0
+    bt.dropna(inplace=True)
+    bt['cum_bh']    = (1 + bt['ret_daily']).cumprod()
+    bt['cum_strat'] = (1 + bt['ret_strat']).cumprod()
 
-        # Filtre MA200 : pas d'achat sous la MA200
-        if row.get('close', 0) < row.get('ma_200', 0):
-            pos = 0.0
+    return bt
 
-        # Surcharge SR : breakout fort → achat confirmé
-        if row.get('signal_breakout_sr', 0) == 1 and row.get('vol_franchissement', 1) >= 2.0:
-            pos = 1.0
-
-        # Surcharge SR : breakdown fort → sortie immédiate
-        if row.get('signal_breakdown_sr', 0) == 1 and row.get('vol_franchissement', 1) >= 2.0:
-            pos = 0.0
-
-        # Proche résistance forte → réduire position
-        if row.get('proche_resistance', 0) == 1 and row.get('score_resistance', 0) >= 50:
-            pos = pos * 0.5  # moitié position
-
-        positions.append(pos)
-
-    bt['position'] = pd.Series(positions, index=bt.index).shift(1).fillna(0)
-    bt['pos_change'] = bt['position'].diff().abs()
-    bt['frais_app']  = bt['pos_change'] * frais
-    bt['ret_strat']  = bt['position'] * bt['ret_daily'] - bt['frais_app']
-    bt['cum_bh']     = (1 + bt['ret_daily']).cumprod()
-    bt['cum_strat']  = (1 + bt['ret_strat']).cumprod()
-
-    return bt.dropna()
-# ─────────────────────────────────────────
-# 5. MÉTRIQUES FINANCIÈRES
-# ─────────────────────────────────────────
 def calculer_metriques(bt):
-    rf = 0.02 / 252  # taux sans risque journalier
+    rf_j    = 0.02 / 252
+    n       = len(bt)
+    ann     = 252 / n
 
     def sharpe(rets):
-        excess = rets - rf
-        return (excess.mean() / excess.std()) * np.sqrt(252) if excess.std() > 0 else 0
+        ex = rets - rf_j
+        return (ex.mean() / ex.std()) * np.sqrt(252) if ex.std() > 0 else 0
 
-    def max_drawdown(cum):
-        dd = (cum / cum.cummax() - 1)
-        return dd.min()
-
-    def calmar(rets, cum):
-        ann_ret = (cum.iloc[-1] ** (252/len(cum))) - 1
-        mdd     = abs(max_drawdown(cum))
-        return ann_ret / mdd if mdd > 0 else 0
+    def max_dd(cum):
+        return float((cum / cum.cummax() - 1).min() * 100)
 
     def sortino(rets):
-        excess   = rets - rf
-        neg_rets = excess[excess < 0]
-        downside = neg_rets.std() * np.sqrt(252) if len(neg_rets) > 0 else 1
-        return excess.mean() * 252 / downside
+        ex   = rets - rf_j
+        neg  = ex[ex < 0]
+        down = neg.std() * np.sqrt(252) if len(neg) > 0 else 1
+        return ex.mean() * 252 / down
 
-    n_jours     = len(bt)
-    ann_factor  = 252 / n_jours
-
-    ret_bh      = float(bt['cum_bh'].iloc[-1] - 1)
     ret_strat   = float(bt['cum_strat'].iloc[-1] - 1)
-    ann_bh      = float((bt['cum_bh'].iloc[-1] ** ann_factor) - 1)
-    ann_strat   = float((bt['cum_strat'].iloc[-1] ** ann_factor) - 1)
+    ret_bh      = float(bt['cum_bh'].iloc[-1] - 1)
+    ann_strat   = float((bt['cum_strat'].iloc[-1] ** ann) - 1)
+    ann_bh      = float((bt['cum_bh'].iloc[-1] ** ann) - 1)
 
-    metriques = {
-        # Returns
-        'ret_total_bh':    round(ret_bh * 100, 2),
-        'ret_total_strat': round(ret_strat * 100, 2),
-        'ret_ann_bh':      round(ann_bh * 100, 2),
-        'ret_ann_strat':   round(ann_strat * 100, 2),
-        # Risque
-        'sharpe_bh':       round(sharpe(bt['ret_daily']), 3),
-        'sharpe_strat':    round(sharpe(bt['ret_strat']), 3),
-        'sortino_bh':      round(sortino(bt['ret_daily']), 3),
-        'sortino_strat':   round(sortino(bt['ret_strat']), 3),
-        'mdd_bh':          round(max_drawdown(bt['cum_bh']) * 100, 2),
-        'mdd_strat':       round(max_drawdown(bt['cum_strat']) * 100, 2),
-        'calmar_bh':       round(calmar(bt['ret_daily'], bt['cum_bh']), 3),
-        'calmar_strat':    round(calmar(bt['ret_strat'], bt['cum_strat']), 3),
-        # Signaux
-        'n_achat':         int((bt['signal'] == 'ACHAT').sum()),
-        'n_vente':         int((bt['signal'] == 'VENTE').sum()),
-        'n_neutre':        int((bt['signal'] == 'NEUTRE').sum()),
-        'win_rate':        round(float((bt['ret_strat'] > 0).mean()) * 100, 2),
-        'jours_investis':  round(float((bt['position'] != 0).mean()) * 100, 2),
-        'n_trades':        int(bt['pos_change'].sum()),
-        # Périodes
-        'date_debut':      bt.index[0].strftime('%Y-%m-%d'),
-        'date_fin':        bt.index[-1].strftime('%Y-%m-%d'),
-        'n_jours':         n_jours,
+    return {
+        'ret_total_strat':  round(ret_strat  * 100, 2),
+        'ret_total_bh':     round(ret_bh     * 100, 2),
+        'ret_ann_strat':    round(ann_strat  * 100, 2),
+        'ret_ann_bh':       round(ann_bh     * 100, 2),
+        'sharpe_strat':     round(sharpe(bt['ret_strat']),   3),
+        'sharpe_bh':        round(sharpe(bt['ret_daily']),   3),
+        'sortino_strat':    round(sortino(bt['ret_strat']),  3),
+        'sortino_bh':       round(sortino(bt['ret_daily']),  3),
+        'mdd_strat':        round(max_dd(bt['cum_strat']),   2),
+        'mdd_bh':           round(max_dd(bt['cum_bh']),      2),
+        'win_rate':         round(float((bt['ret_strat']>0).mean()) * 100, 2),
+        'jours_investis':   round(float((bt['position']>0).mean()) * 100, 2),
+        'n_trades':         int(bt['pos_change'].sum()),
+        'n_signaux':        int((bt['proba'] >= 0.55).sum()),
+        'date_debut':       bt.index[0].strftime('%Y-%m-%d'),
+        'date_fin':         bt.index[-1].strftime('%Y-%m-%d'),
+        'n_jours':          n,
     }
-    return metriques
 
 # ─────────────────────────────────────────
-# 6. PRÉPARER DONNÉES JSON POUR HTML
+# 4. RÉSUMÉ CONSOLE
 # ─────────────────────────────────────────
-def preparer_json(bt, step=3):
-    """Sous-échantillonne pour alléger le HTML."""
-    sub = bt.iloc[::step].copy()
-    data = []
-    for date, row in sub.iterrows():
-        data.append({
-            'date':       date.strftime('%Y-%m-%d'),
-            'cum_bh':     round(float(row['cum_bh']), 4),
-            'cum_strat':  round(float(row['cum_strat']), 4),
-            'proba':      round(float(row.get('proba', 0.5)), 3),
-            'signal':     str(row.get('signal', 'NEUTRE')),
-            'regime':     str(row.get('regime', '')),
-            'prix':       round(float(row['close']), 2),
-            'dd_bh':      round(float(row['cum_bh'] / bt['cum_bh'].cummax()[row.name] - 1) * 100, 3)
-                          if row.name in bt.index else 0,
-            'dd_strat':   round(float(row['cum_strat'] / bt['cum_strat'].cummax()[row.name] - 1) * 100, 3)
-                          if row.name in bt.index else 0,
-        })
-    return data
+def afficher_resultats(seuil, m):
+    print(f"\n  Seuil {seuil:.2f} :")
+    print(f"    Ret strat     : {m['ret_total_strat']:+.1f}%  vs BH : {m['ret_total_bh']:+.1f}%")
+    print(f"    Ret ann.      : {m['ret_ann_strat']:+.2f}%  vs BH : {m['ret_ann_bh']:+.2f}%")
+    print(f"    Sharpe        : {m['sharpe_strat']:.3f}  vs BH : {m['sharpe_bh']:.3f}")
+    print(f"    Sortino       : {m['sortino_strat']:.3f}  vs BH : {m['sortino_bh']:.3f}")
+    print(f"    Max DD        : {m['mdd_strat']:.1f}%  vs BH : {m['mdd_bh']:.1f}%")
+    print(f"    Win Rate      : {m['win_rate']}%")
+    print(f"    Jours investis: {m['jours_investis']}%")
+    print(f"    Nb trades     : {m['n_trades']}")
 
 # ─────────────────────────────────────────
-# 7. GÉNÉRATION HTML BACKTEST
+# 5. GÉNÉRATION HTML
 # ─────────────────────────────────────────
-def generer_html_backtest(metriques, bt_data, bt):
-    m    = metriques
-    gain = m['ret_total_strat'] - m['ret_total_bh']
-    col  = '#00ff88' if gain >= 0 else '#ff3355'
+def generer_html(resultats_seuils, bt_best, m_best, seuil_best, probas, df):
+    # Données JSON pour les graphiques
+    step = max(1, len(bt_best) // 500)
+    sub  = bt_best.iloc[::step]
 
-    # Distribution mensuelle des signaux
-    bt['mois'] = bt.index.to_period('M').astype(str)
-    monthly = bt.groupby('mois').apply(lambda g: {
-        'ret_strat': round(float((1+g['ret_strat']).prod()-1)*100, 2),
-        'ret_bh':    round(float((1+g['ret_daily']).prod()-1)*100, 2),
-        'n_achat':   int((g['signal']=='ACHAT').sum()),
-        'n_vente':   int((g['signal']=='VENTE').sum()),
-    }).to_dict()
+    bt_json = json.dumps([{
+        'date':      d.strftime('%Y-%m-%d'),
+        'cum_bh':    round(float(r['cum_bh']),    4),
+        'cum_strat': round(float(r['cum_strat']), 4),
+        'proba':     round(float(r['proba']),      3),
+        'pos':       int(r['position']),
+        'dd_bh':     round(float(r['cum_bh']    / bt_best['cum_bh'].cummax()[r.name]    - 1) * 100, 2),
+        'dd_strat':  round(float(r['cum_strat'] / bt_best['cum_strat'].cummax()[r.name] - 1) * 100, 2),
+        'prix':      round(float(r['close']), 2),
+    } for d, r in sub.iterrows()])
 
-    monthly_json = json.dumps([
-        {'mois': k, **v} for k,v in list(monthly.items())[-36:]
-    ])
-    bt_json    = json.dumps(bt_data)
-    met_json   = json.dumps(m)
+    seuils_json = json.dumps([{
+        'seuil':   s,
+        'sharpe':  m['sharpe_strat'],
+        'ret':     m['ret_ann_strat'],
+        'mdd':     m['mdd_strat'],
+        'investi': m['jours_investis'],
+    } for s, m in resultats_seuils.items()])
+
+    m = m_best
+
+    # Distribution des probas
+    hist_data = np.histogram(probas, bins=20, range=(0,1))
+    hist_json = json.dumps({
+        'counts': hist_data[0].tolist(),
+        'edges':  [round(e,2) for e in hist_data[1].tolist()],
+    })
 
     html = f"""<!DOCTYPE html>
 <html lang="fr">
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Backtest — S&P 500 Regime Switching</title>
-<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=Archivo+Black&family=Archivo:wght@300;400;600&display=swap" rel="stylesheet"/>
+<title>Backtest Long Only — S&P 500</title>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;700&family=Manrope:wght@300;400;600;800;900&display=swap" rel="stylesheet"/>
 <style>
 :root{{
-  --bg:#07090d; --bg2:#0e1117; --bg3:#151b24; --border:#1c2530;
-  --green:#00e676; --red:#ff1744; --yellow:#ffd600; --blue:#2979ff;
-  --purple:#d500f9; --cyan:#00e5ff;
-  --text:#eceff4; --muted:#546e7a;
+  --bg:#05080c;--bg2:#0a0f16;--bg3:#0f1822;--border:#162030;
+  --green:#00ff9d;--red:#ff2d5b;--yellow:#ffd000;--blue:#0090ff;
+  --cyan:#00d4ff;--purple:#b36eff;
+  --text:#dde6f0;--muted:#3d5a73;
 }}
 *{{margin:0;padding:0;box-sizing:border-box}}
-body{{background:var(--bg);color:var(--text);font-family:'Archivo',sans-serif;min-height:100vh}}
-body::before{{content:'';position:fixed;inset:0;
-  background:radial-gradient(ellipse 60% 40% at 10% 10%,rgba(0,230,118,.05) 0,transparent 60%),
-             radial-gradient(ellipse 50% 60% at 90% 90%,rgba(41,121,255,.05) 0,transparent 60%);
-  pointer-events:none;z-index:0}}
+body{{background:var(--bg);color:var(--text);font-family:'Manrope',sans-serif;min-height:100vh}}
+body::before{{content:'';position:fixed;inset:0;pointer-events:none;z-index:0;
+  background:radial-gradient(ellipse 80% 50% at 0% 0%,rgba(0,255,157,.04) 0,transparent 60%),
+             radial-gradient(ellipse 60% 80% at 100% 100%,rgba(0,144,255,.04) 0,transparent 60%)}}
 
-/* HEADER */
-.hdr{{position:relative;z-index:10;display:flex;align-items:center;justify-content:space-between;
-  padding:18px 36px;border-bottom:1px solid var(--border);background:rgba(14,17,23,.9);
-  backdrop-filter:blur(12px)}}
-.hdr-logo{{font-family:'Archivo Black',sans-serif;font-size:16px;letter-spacing:3px;
-  background:linear-gradient(135deg,var(--green),var(--cyan));
+.hdr{{position:relative;z-index:10;padding:20px 40px;border-bottom:1px solid var(--border);
+  display:flex;align-items:center;justify-content:space-between;
+  background:rgba(10,15,22,.85);backdrop-filter:blur(16px)}}
+.logo{{font-family:'IBM Plex Mono',monospace;font-size:13px;font-weight:700;letter-spacing:3px;
+  background:linear-gradient(90deg,var(--green),var(--cyan));
   -webkit-background-clip:text;-webkit-text-fill-color:transparent}}
-.hdr-meta{{font-family:'DM Mono',monospace;font-size:10px;color:var(--muted);letter-spacing:1px}}
+.hdr-r{{font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--muted);letter-spacing:1px}}
 
-/* TABS */
-.tabs{{position:relative;z-index:10;display:flex;padding:0 36px;
-  background:var(--bg2);border-bottom:1px solid var(--border)}}
-.tab{{padding:14px 24px;font-family:'DM Mono',monospace;font-size:10px;font-weight:500;
+.tabs{{display:flex;padding:0 40px;background:var(--bg2);border-bottom:1px solid var(--border);
+  position:relative;z-index:10}}
+.tab{{padding:14px 22px;font-family:'IBM Plex Mono',monospace;font-size:10px;font-weight:500;
   letter-spacing:2px;text-transform:uppercase;color:var(--muted);cursor:pointer;
   border-bottom:2px solid transparent;transition:all .2s;user-select:none}}
 .tab:hover{{color:var(--text)}}
 .tab.on{{color:var(--green);border-bottom-color:var(--green)}}
-
-/* PANELS */
 .panel{{display:none;position:relative;z-index:5;animation:fi .3s ease}}
 .panel.on{{display:block}}
 @keyframes fi{{from{{opacity:0;transform:translateY(6px)}}to{{opacity:1;transform:translateY(0)}}}}
 
-/* ── ONGLET 1 — RÉSUMÉ ── */
-.page{{padding:32px 36px;max-width:1440px;margin:0 auto}}
+.page{{padding:32px 40px;max-width:1400px;margin:0 auto}}
 
+/* KPIs */
 .kpi-grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:24px}}
-.kpi{{background:var(--bg2);border:1px solid var(--border);border-radius:12px;
-  padding:22px 24px;position:relative;overflow:hidden}}
-.kpi::before{{content:'';position:absolute;top:0;left:0;right:0;height:2px}}
-.kpi.g::before{{background:var(--green)}}
-.kpi.r::before{{background:var(--red)}}
-.kpi.b::before{{background:var(--blue)}}
-.kpi.y::before{{background:var(--yellow)}}
-.kpi-label{{font-family:'DM Mono',monospace;font-size:9px;color:var(--muted);
-  letter-spacing:2px;text-transform:uppercase;margin-bottom:10px}}
-.kpi-val{{font-family:'Archivo Black',sans-serif;font-size:28px;line-height:1}}
-.kpi-sub{{font-size:11px;color:var(--muted);margin-top:6px}}
-.kpi-sub span{{font-weight:600}}
+.kpi{{background:var(--bg2);border:1px solid var(--border);border-radius:14px;
+  padding:24px;position:relative;overflow:hidden}}
+.kpi::after{{content:'';position:absolute;top:0;left:0;right:0;height:2px}}
+.kpi.g::after{{background:linear-gradient(90deg,var(--green),var(--cyan))}}
+.kpi.b::after{{background:linear-gradient(90deg,var(--blue),var(--purple))}}
+.kpi.y::after{{background:var(--yellow)}}
+.kpi.r::after{{background:var(--red)}}
+.kpi-lbl{{font-family:'IBM Plex Mono',monospace;font-size:9px;color:var(--muted);
+  letter-spacing:2px;text-transform:uppercase;margin-bottom:12px}}
+.kpi-val{{font-family:'Manrope',sans-serif;font-size:30px;font-weight:900;line-height:1}}
+.kpi-sub{{font-size:11px;color:var(--muted);margin-top:8px}}
+.kpi-sub b{{color:var(--text)}}
+.green{{color:var(--green)}} .red{{color:var(--red)}}
+.blue{{color:var(--blue)}}   .yellow{{color:var(--yellow)}}
+.cyan{{color:var(--cyan)}}
 
-.compare-grid{{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:24px}}
-.cmp-card{{background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:24px}}
-.cmp-title{{font-family:'DM Mono',monospace;font-size:9px;color:var(--muted);
+/* Compare */
+.cmp-grid{{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:24px}}
+.cmp{{background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:24px}}
+.cmp-ttl{{font-family:'IBM Plex Mono',monospace;font-size:9px;color:var(--muted);
   letter-spacing:2px;text-transform:uppercase;margin-bottom:16px;
   padding-bottom:10px;border-bottom:1px solid var(--border)}}
-.cmp-row{{display:flex;justify-content:space-between;align-items:center;
-  padding:9px 0;border-bottom:1px solid var(--border)20;font-size:12px}}
-.cmp-row:last-child{{border-bottom:none}}
-.cmp-key{{color:var(--muted)}}
-.cmp-v{{font-family:'DM Mono',monospace;font-weight:500}}
-.green{{color:var(--green)}} .red{{color:var(--red)}}
-.yellow{{color:var(--yellow)}} .blue{{color:var(--blue)}}
+.row{{display:flex;justify-content:space-between;align-items:center;
+  padding:9px 0;border-bottom:1px solid rgba(22,32,48,.6);font-size:12px}}
+.row:last-child{{border:none}}
+.rk{{color:var(--muted)}}
+.rv{{font-family:'IBM Plex Mono',monospace;font-weight:500}}
 
-.signals-row{{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-bottom:24px}}
-.sig-box{{background:var(--bg2);border:1px solid var(--border);border-radius:12px;
-  padding:20px;text-align:center}}
-.sig-ico{{font-size:32px;margin-bottom:8px}}
-.sig-n{{font-family:'Archivo Black',sans-serif;font-size:32px}}
-.sig-lbl{{font-size:10px;color:var(--muted);letter-spacing:1px;margin-top:4px}}
-
-/* CHART AREA */
+/* Charts */
 .chart-box{{background:var(--bg2);border:1px solid var(--border);border-radius:12px;
   overflow:hidden;margin-bottom:20px}}
 .chart-hdr{{display:flex;align-items:center;justify-content:space-between;
   padding:14px 20px;border-bottom:1px solid var(--border)}}
-.chart-title{{font-family:'DM Mono',monospace;font-size:11px;font-weight:500;letter-spacing:1px}}
-.legend{{display:flex;gap:16px}}
-.leg{{display:flex;align-items:center;gap:6px;font-size:10px;color:var(--muted)}}
-.leg-dot{{width:24px;height:2px;border-radius:1px}}
+.chart-ttl{{font-family:'IBM Plex Mono',monospace;font-size:11px;font-weight:500;letter-spacing:1px}}
+.leg{{display:flex;gap:16px}}
+.li{{display:flex;align-items:center;gap:6px;font-size:10px;color:var(--muted)}}
+.ld{{width:24px;height:2px;border-radius:1px}}
 canvas{{display:block;width:100%}}
 
-/* ── ONGLET 2 — COURBES ── */
-/* ── ONGLET 3 — MENSUEL ── */
-.month-grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px}}
-.month-card{{background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:14px}}
-.mc-date{{font-family:'DM Mono',monospace;font-size:9px;color:var(--muted);margin-bottom:8px}}
-.mc-ret{{font-family:'Archivo Black',sans-serif;font-size:20px}}
-.mc-sub{{font-size:10px;color:var(--muted);margin-top:4px}}
-.mc-sigs{{display:flex;gap:8px;margin-top:8px;font-size:10px}}
+/* Seuil selector */
+.seuil-grid{{display:grid;grid-template-columns:repeat(6,1fr);gap:10px;margin-bottom:24px}}
+.seuil-btn{{background:var(--bg2);border:1px solid var(--border);border-radius:8px;
+  padding:14px 10px;text-align:center;cursor:pointer;transition:all .2s}}
+.seuil-btn:hover,.seuil-btn.active{{border-color:var(--green);background:rgba(0,255,157,.06)}}
+.sb-val{{font-family:'IBM Plex Mono',monospace;font-size:14px;font-weight:700;color:var(--green)}}
+.sb-sub{{font-size:10px;color:var(--muted);margin-top:4px}}
+
+/* Règle */
+.regle{{background:var(--bg2);border:1px solid var(--green)33;border-radius:12px;
+  padding:24px;margin-bottom:24px;position:relative;overflow:hidden}}
+.regle::before{{content:'';position:absolute;inset:0;
+  background:radial-gradient(ellipse 60% 80% at 0% 50%,rgba(0,255,157,.06) 0,transparent 70%);
+  pointer-events:none}}
+.regle-ttl{{font-family:'IBM Plex Mono',monospace;font-size:9px;color:var(--green);
+  letter-spacing:2px;text-transform:uppercase;margin-bottom:16px}}
+.regle-rule{{font-family:'IBM Plex Mono',monospace;font-size:15px;font-weight:700;
+  color:var(--text);line-height:2.2}}
+.regle-rule .g{{color:var(--green)}}
+.regle-rule .r{{color:var(--red)}}
+.regle-rule .y{{color:var(--yellow)}}
+
+/* Signal today */
+.signal-box{{background:var(--bg2);border:1px solid var(--border);border-radius:12px;
+  padding:24px;text-align:center}}
 </style>
 </head>
 <body>
 
 <div class="hdr">
-  <div class="hdr-logo">BACKTEST · S&P 500</div>
-  <div class="hdr-meta">
-    {m['date_debut']} → {m['date_fin']} · {m['n_jours']} jours
-  </div>
+  <div class="logo">BACKTEST · LONG ONLY · S&P 500</div>
+  <div class="hdr-r">{m['date_debut']} → {m['date_fin']} · {m['n_jours']}j · seuil optimal : {seuil_best:.2f}</div>
 </div>
 
 <div class="tabs">
-  <div class="tab on" onclick="sw('resume',this)">📋 Résumé</div>
-  <div class="tab" onclick="sw('courbes',this)">📈 Courbes</div>
-  <div class="tab" onclick="sw('mensuel',this)">📅 Mensuel</div>
+  <div class="tab on"  onclick="sw('resume',this)">📋 Résumé</div>
+  <div class="tab"     onclick="sw('courbes',this)">📈 Courbes</div>
+  <div class="tab"     onclick="sw('seuils',this)">🎯 Seuils</div>
 </div>
 
-<!-- ═══════════════════════════════ RÉSUMÉ ═══════════════════════════════ -->
+<!-- ══════════ RÉSUMÉ ══════════ -->
 <div id="p-resume" class="panel on">
 <div class="page">
 
-  <div class="kpi-grid">
-    <div class="kpi {'g' if m['ret_total_strat'] >= 0 else 'r'}">
-      <div class="kpi-label">Rendement Total Stratégie</div>
-      <div class="kpi-val {'green' if m['ret_total_strat']>=0 else 'red'}">{m['ret_total_strat']:+.1f}%</div>
-      <div class="kpi-sub">vs Buy&Hold <span class="{'green' if m['ret_total_bh']>=0 else 'red'}">{m['ret_total_bh']:+.1f}%</span></div>
+  <!-- Règle de trading -->
+  <div class="regle">
+    <div class="regle-ttl">Règle de trading</div>
+    <div class="regle-rule">
+      SI <span class="g">P(forte hausse &gt; +1.5% / 5j) &gt; {seuil_best:.2f}</span> → <span class="g">🟢 BUY</span><br>
+      SINON → <span class="y">🟡 CASH</span> (aucune position)<br>
+      <span class="r">❌ Jamais de short</span>
     </div>
-    <div class="kpi {'g' if m['sharpe_strat'] >= m['sharpe_bh'] else 'r'}">
-      <div class="kpi-label">Sharpe Ratio Stratégie</div>
-      <div class="kpi-val {'green' if m['sharpe_strat']>=m['sharpe_bh'] else 'red'}">{m['sharpe_strat']}</div>
-      <div class="kpi-sub">vs Buy&Hold <span>{m['sharpe_bh']}</span></div>
+  </div>
+
+  <!-- KPIs -->
+  <div class="kpi-grid">
+    <div class="kpi {'g' if m['ret_total_strat'] >= m['ret_total_bh'] else 'r'}">
+      <div class="kpi-lbl">Rendement Total</div>
+      <div class="kpi-val {'green' if m['ret_total_strat']>=0 else 'red'}">{m['ret_total_strat']:+.1f}%</div>
+      <div class="kpi-sub">vs B&H <b class="{'green' if m['ret_total_bh']>=0 else 'red'}">{m['ret_total_bh']:+.1f}%</b></div>
+    </div>
+    <div class="kpi {'g' if m['sharpe_strat'] >= m['sharpe_bh'] else 'b'}">
+      <div class="kpi-lbl">Sharpe Ratio</div>
+      <div class="kpi-val {'green' if m['sharpe_strat']>=m['sharpe_bh'] else 'blue'}">{m['sharpe_strat']}</div>
+      <div class="kpi-sub">vs B&H <b>{m['sharpe_bh']}</b></div>
     </div>
     <div class="kpi {'g' if abs(m['mdd_strat']) < abs(m['mdd_bh']) else 'r'}">
-      <div class="kpi-label">Max Drawdown Stratégie</div>
-      <div class="kpi-val {'green' if abs(m['mdd_strat'])<abs(m['mdd_bh']) else 'red'}">{m['mdd_strat']:.1f}%</div>
-      <div class="kpi-sub">vs Buy&Hold <span class="red">{m['mdd_bh']:.1f}%</span></div>
+      <div class="kpi-lbl">Max Drawdown</div>
+      <div class="kpi-val red">{m['mdd_strat']:.1f}%</div>
+      <div class="kpi-sub">vs B&H <b class="red">{m['mdd_bh']:.1f}%</b></div>
     </div>
     <div class="kpi b">
-      <div class="kpi-label">Win Rate</div>
-      <div class="kpi-val blue">{m['win_rate']}%</div>
-      <div class="kpi-sub">Investi <span>{m['jours_investis']}%</span> du temps</div>
+      <div class="kpi-lbl">Jours Investis</div>
+      <div class="kpi-val blue">{m['jours_investis']}%</div>
+      <div class="kpi-sub">Win rate <b>{m['win_rate']}%</b></div>
     </div>
   </div>
 
-  <div class="compare-grid">
-    <div class="cmp-card">
-      <div class="cmp-title">Stratégie Regime Switching</div>
-      <div class="cmp-row"><span class="cmp-key">Rendement annualisé</span><span class="cmp-v {'green' if m['ret_ann_strat']>=0 else 'red'}">{m['ret_ann_strat']:+.2f}%</span></div>
-      <div class="cmp-row"><span class="cmp-key">Sharpe</span><span class="cmp-v">{m['sharpe_strat']}</span></div>
-      <div class="cmp-row"><span class="cmp-key">Sortino</span><span class="cmp-v">{m['sortino_strat']}</span></div>
-      <div class="cmp-row"><span class="cmp-key">Calmar</span><span class="cmp-v">{m['calmar_strat']}</span></div>
-      <div class="cmp-row"><span class="cmp-key">Max Drawdown</span><span class="cmp-v red">{m['mdd_strat']:.2f}%</span></div>
-      <div class="cmp-row"><span class="cmp-key">Nb trades</span><span class="cmp-v">{m['n_trades']}</span></div>
-      <div class="cmp-row"><span class="cmp-key">Win rate</span><span class="cmp-v green">{m['win_rate']}%</span></div>
+  <!-- Comparaison -->
+  <div class="cmp-grid">
+    <div class="cmp">
+      <div class="cmp-ttl">🟢 Stratégie Long Only (seuil {seuil_best:.2f})</div>
+      <div class="row"><span class="rk">Rendement annualisé</span><span class="rv {'green' if m['ret_ann_strat']>=0 else 'red'}">{m['ret_ann_strat']:+.2f}%</span></div>
+      <div class="row"><span class="rk">Sharpe</span><span class="rv">{m['sharpe_strat']}</span></div>
+      <div class="row"><span class="rk">Sortino</span><span class="rv">{m['sortino_strat']}</span></div>
+      <div class="row"><span class="rk">Max Drawdown</span><span class="rv red">{m['mdd_strat']:.2f}%</span></div>
+      <div class="row"><span class="rk">Win Rate</span><span class="rv green">{m['win_rate']}%</span></div>
+      <div class="row"><span class="rk">Nb trades</span><span class="rv">{m['n_trades']}</span></div>
+      <div class="row"><span class="rk">Temps en marché</span><span class="rv">{m['jours_investis']}%</span></div>
     </div>
-    <div class="cmp-card">
-      <div class="cmp-title">Buy & Hold (référence)</div>
-      <div class="cmp-row"><span class="cmp-key">Rendement annualisé</span><span class="cmp-v {'green' if m['ret_ann_bh']>=0 else 'red'}">{m['ret_ann_bh']:+.2f}%</span></div>
-      <div class="cmp-row"><span class="cmp-key">Sharpe</span><span class="cmp-v">{m['sharpe_bh']}</span></div>
-      <div class="cmp-row"><span class="cmp-key">Sortino</span><span class="cmp-v">{m['sortino_bh']}</span></div>
-      <div class="cmp-row"><span class="cmp-key">Calmar</span><span class="cmp-v">{m['calmar_bh']}</span></div>
-      <div class="cmp-row"><span class="cmp-key">Max Drawdown</span><span class="cmp-v red">{m['mdd_bh']:.2f}%</span></div>
-      <div class="cmp-row"><span class="cmp-key">Nb trades</span><span class="cmp-v">1</span></div>
-      <div class="cmp-row"><span class="cmp-key">Investi</span><span class="cmp-v">100% du temps</span></div>
-    </div>
-  </div>
-
-  <div class="signals-row">
-    <div class="sig-box">
-      <div class="sig-ico">🟢</div>
-      <div class="sig-n green">{m['n_achat']}</div>
-      <div class="sig-lbl">Signaux ACHAT</div>
-    </div>
-    <div class="sig-box">
-      <div class="sig-ico">🟡</div>
-      <div class="sig-n yellow">{m['n_neutre']}</div>
-      <div class="sig-lbl">Signaux NEUTRE</div>
-    </div>
-    <div class="sig-box">
-      <div class="sig-ico">🔴</div>
-      <div class="sig-n red">{m['n_vente']}</div>
-      <div class="sig-lbl">Signaux VENTE</div>
+    <div class="cmp">
+      <div class="cmp-ttl">📊 Buy & Hold (référence)</div>
+      <div class="row"><span class="rk">Rendement annualisé</span><span class="rv {'green' if m['ret_ann_bh']>=0 else 'red'}">{m['ret_ann_bh']:+.2f}%</span></div>
+      <div class="row"><span class="rk">Sharpe</span><span class="rv">{m['sharpe_bh']}</span></div>
+      <div class="row"><span class="rk">Sortino</span><span class="rv">{m['sortino_bh']}</span></div>
+      <div class="row"><span class="rk">Max Drawdown</span><span class="rv red">{m['mdd_bh']:.2f}%</span></div>
+      <div class="row"><span class="rk">Win Rate</span><span class="rv">{float((bt_best['ret_daily']>0).mean()*100):.1f}%</span></div>
+      <div class="row"><span class="rk">Nb trades</span><span class="rv">1</span></div>
+      <div class="row"><span class="rk">Temps en marché</span><span class="rv">100%</span></div>
     </div>
   </div>
 
+  <!-- Chart perf -->
   <div class="chart-box">
     <div class="chart-hdr">
-      <span class="chart-title">PERFORMANCE CUMULÉE</span>
-      <div class="legend">
-        <div class="leg"><div class="leg-dot" style="background:#00e676"></div>Stratégie</div>
-        <div class="leg"><div class="leg-dot" style="background:#2979ff"></div>Buy & Hold</div>
+      <span class="chart-ttl">PERFORMANCE CUMULÉE</span>
+      <div class="leg">
+        <div class="li"><div class="ld" style="background:var(--green)"></div>Long Only</div>
+        <div class="li"><div class="ld" style="background:var(--blue)"></div>Buy & Hold</div>
       </div>
     </div>
     <canvas id="cumChart" height="280"></canvas>
   </div>
 
+  <!-- Chart DD -->
   <div class="chart-box">
     <div class="chart-hdr">
-      <span class="chart-title">DRAWDOWN</span>
-      <div class="legend">
-        <div class="leg"><div class="leg-dot" style="background:#00e676"></div>Stratégie</div>
-        <div class="leg"><div class="leg-dot" style="background:#2979ff"></div>Buy & Hold</div>
+      <span class="chart-ttl">DRAWDOWN</span>
+      <div class="leg">
+        <div class="li"><div class="ld" style="background:var(--green)"></div>Stratégie</div>
+        <div class="li"><div class="ld" style="background:var(--blue)"></div>Buy & Hold</div>
       </div>
     </div>
     <canvas id="ddChart" height="160"></canvas>
@@ -489,199 +387,242 @@ canvas{{display:block;width:100%}}
 </div>
 </div>
 
-<!-- ═══════════════════════════════ COURBES ═══════════════════════════════ -->
+<!-- ══════════ COURBES ══════════ -->
 <div id="p-courbes" class="panel">
 <div class="page">
   <div class="chart-box">
-    <div class="chart-hdr">
-      <span class="chart-title">PROBABILITÉ DE HAUSSE — SIGNAL JOURNALIER</span>
-      <div class="legend">
-        <div class="leg"><div class="leg-dot" style="background:#00e676"></div>ACHAT</div>
-        <div class="leg"><div class="leg-dot" style="background:#ffd600"></div>NEUTRE</div>
-        <div class="leg"><div class="leg-dot" style="background:#ff1744"></div>VENTE</div>
-      </div>
-    </div>
-    <canvas id="probaChart" height="240"></canvas>
+    <div class="chart-hdr"><span class="chart-ttl">PROBABILITÉ DE FORTE HAUSSE + ZONES D'ACHAT</span></div>
+    <canvas id="probaChart" height="260"></canvas>
   </div>
   <div class="chart-box">
-    <div class="chart-hdr"><span class="chart-title">PRIX S&P 500</span></div>
-    <canvas id="prixChart" height="220"></canvas>
+    <div class="chart-hdr"><span class="chart-ttl">DISTRIBUTION DES PROBABILITÉS</span></div>
+    <canvas id="histChart" height="200"></canvas>
   </div>
 </div>
 </div>
 
-<!-- ═══════════════════════════════ MENSUEL ═══════════════════════════════ -->
-<div id="p-mensuel" class="panel">
+<!-- ══════════ SEUILS ══════════ -->
+<div id="p-seuils" class="panel">
 <div class="page">
-  <div class="month-grid" id="monthGrid"></div>
+  <p style="color:var(--muted);font-size:12px;margin-bottom:16px">
+    Cliquez sur un seuil pour voir ses métriques détaillées.
+  </p>
+  <div class="seuil-grid" id="seuilGrid"></div>
+  <div id="seuilDetail"></div>
+  <div class="chart-box" style="margin-top:20px">
+    <div class="chart-hdr"><span class="chart-ttl">SHARPE RATIO PAR SEUIL</span></div>
+    <canvas id="sharpeChart" height="200"></canvas>
+  </div>
 </div>
 </div>
 
 <script>
-const BT   = {bt_json};
-const MET  = {met_json};
-const MON  = {monthly_json};
+const BT      = {bt_json};
+const SEUILS  = {seuils_json};
+const HIST    = {hist_json};
+const MBEST   = {json.dumps(m_best)};
+const SBEST   = {seuil_best};
 
-function sw(name,el){{
+function sw(n,el){{
   document.querySelectorAll('.panel').forEach(p=>p.classList.remove('on'));
   document.querySelectorAll('.tab').forEach(t=>t.classList.remove('on'));
-  document.getElementById('p-'+name).classList.add('on');
-  el.classList.add('on');
-  if(name==='resume') {{drawCum(); drawDD();}}
-  if(name==='courbes'){{drawProba(); drawPrix();}}
-  if(name==='mensuel') drawMonthly();
+  document.getElementById('p-'+n).classList.add('on'); el.classList.add('on');
+  if(n==='resume') {{drawCum();drawDD();}}
+  if(n==='courbes'){{drawProba();drawHist();}}
+  if(n==='seuils') {{drawSeuils();drawSharpe();}}
 }}
 
 function getCtx(id,h){{
   const c=document.getElementById(id);
-  c.width=c.parentElement.clientWidth;
-  c.height=h||280;
-  const ctx=c.getContext('2d');
-  ctx.clearRect(0,0,c.width,c.height);
+  c.width=c.parentElement.clientWidth; c.height=h||280;
+  const ctx=c.getContext('2d'); ctx.clearRect(0,0,c.width,c.height);
   return{{ctx,w:c.width,h:c.height}};
 }}
-function mapY(v,mn,mx,t,b){{return t+(1-(v-mn)/(mx-mn))*(b-t);}}
+function mY(v,mn,mx,t,b){{return t+(1-(v-mn)/(mx-mn))*(b-t);}}
 
-function drawLine(ctx,data,key,color,w,h,PAD,mn,mx,lw=1.8){{
-  ctx.beginPath();let f=true;
-  data.forEach((d,i)=>{{
-    const x=PAD.l+(i/(data.length-1))*(w-PAD.l-PAD.r);
-    const y=mapY(d[key],mn,mx,PAD.t,h-PAD.b);
-    f?ctx.moveTo(x,y):ctx.lineTo(x,y);f=false;
-  }});
-  ctx.strokeStyle=color;ctx.lineWidth=lw;ctx.stroke();
-}}
-
-function drawGrid(ctx,w,h,PAD,mn,mx,steps=5,unit=''){{
-  ctx.fillStyle='#07090d';ctx.fillRect(0,0,w,h);
+function drawGrid(ctx,w,h,PAD,mn,mx,steps,unit){{
+  ctx.fillStyle='#0a0f16'; ctx.fillRect(0,0,w,h);
   for(let i=0;i<=steps;i++){{
     const v=mn+(mx-mn)*i/steps;
-    const y=mapY(v,mn,mx,PAD.t,h-PAD.b);
-    ctx.strokeStyle='#1c2530';ctx.lineWidth=1;
-    ctx.beginPath();ctx.moveTo(PAD.l,y);ctx.lineTo(w-PAD.r,y);ctx.stroke();
-    ctx.fillStyle='#546e7a';ctx.font='9px DM Mono';
-    ctx.fillText(v.toFixed(1)+unit,4,y+3);
+    const y=mY(v,mn,mx,PAD.t,h-PAD.b);
+    ctx.strokeStyle='#162030'; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(PAD.l,y); ctx.lineTo(w-PAD.r,y); ctx.stroke();
+    ctx.fillStyle='#3d5a73'; ctx.font='9px IBM Plex Mono';
+    ctx.fillText(v.toFixed(1)+unit, 4, y+3);
   }}
 }}
 
-// ── Cumul ──────────────────────────────────────────────────
+function drawLine(ctx,data,key,col,w,h,PAD,mn,mx,lw){{
+  ctx.beginPath(); let f=true;
+  data.forEach((d,i)=>{{
+    const x=PAD.l+(i/(data.length-1))*(w-PAD.l-PAD.r);
+    const y=mY(d[key],mn,mx,PAD.t,h-PAD.b);
+    f?ctx.moveTo(x,y):ctx.lineTo(x,y); f=false;
+  }});
+  ctx.strokeStyle=col; ctx.lineWidth=lw||1.8; ctx.stroke();
+}}
+
 function drawCum(){{
   const{{ctx,w,h}}=getCtx('cumChart',280);
-  const PAD={{l:50,r:20,t:16,b:30}};
+  const PAD={{l:50,r:16,t:16,b:30}};
   const mn=Math.min(...BT.map(d=>Math.min(d.cum_bh,d.cum_strat)))*0.98;
   const mx=Math.max(...BT.map(d=>Math.max(d.cum_bh,d.cum_strat)))*1.02;
   drawGrid(ctx,w,h,PAD,mn,mx,6,'x');
-  drawLine(ctx,BT,'cum_bh',  '#2979ff',w,h,PAD,mn,mx,1.5);
-  drawLine(ctx,BT,'cum_strat','#00e676',w,h,PAD,mn,mx,2);
-  // Dates
-  const step=Math.ceil(BT.length/8);
-  ctx.fillStyle='#546e7a';ctx.font='9px DM Mono';
-  BT.forEach((d,i)=>{{if(i%step===0){{
-    const x=PAD.l+(i/(BT.length-1))*(w-PAD.l-PAD.r);
-    ctx.fillText(d.date.slice(0,7),x-18,h-6);
-  }}}});
-}}
-
-// ── Drawdown ───────────────────────────────────────────────
-function drawDD(){{
-  const{{ctx,w,h}}=getCtx('ddChart',160);
-  const PAD={{l:50,r:20,t:10,b:26}};
-  const mn=Math.min(...BT.map(d=>Math.min(d.dd_bh||0,d.dd_strat||0)))*1.05;
-  const mx=0;
-  drawGrid(ctx,w,h,PAD,mn,mx,4,'%');
-  // Fill BH
-  ctx.beginPath();
-  BT.forEach((d,i)=>{{const x=PAD.l+(i/(BT.length-1))*(w-PAD.l-PAD.r);
-    i===0?ctx.moveTo(x,mapY(0,mn,mx,PAD.t,h-PAD.b)):ctx.lineTo(x,mapY(d.dd_bh||0,mn,mx,PAD.t,h-PAD.b));
-  }});
-  ctx.fillStyle='rgba(41,121,255,0.15)';ctx.fill();
-  drawLine(ctx,BT,'dd_bh','#2979ff',w,h,PAD,mn,mx,1.2);
-  drawLine(ctx,BT,'dd_strat','#00e676',w,h,PAD,mn,mx,1.5);
-}}
-
-// ── Proba ─────────────────────────────────────────────────
-function drawProba(){{
-  const{{ctx,w,h}}=getCtx('probaChart',240);
-  const PAD={{l:50,r:20,t:12,b:30}};
-  drawGrid(ctx,w,h,PAD,0,1,4,'');
-  // Barres colorées
-  const bw=Math.max(1,(w-PAD.l-PAD.r)/BT.length);
+  // Zone investie
   BT.forEach((d,i)=>{{
-    const x=PAD.l+i*bw;
-    const col=d.signal==='ACHAT'?'#00e67666':d.signal==='VENTE'?'#ff174466':'#ffd60044';
-    ctx.fillStyle=col;
-    const y=mapY(d.proba,0,1,PAD.t,h-PAD.b);
-    ctx.fillRect(x,y,bw,h-PAD.b-y);
-  }});
-  // Seuils
-  [0.6,0.5,0.4].forEach(v=>{{
-    ctx.strokeStyle=v===0.5?'#ffffff22':'#ffffff44';
-    ctx.lineWidth=1;ctx.setLineDash(v===0.5?[3,3]:[]);
-    ctx.beginPath();ctx.moveTo(PAD.l,mapY(v,0,1,PAD.t,h-PAD.b));
-    ctx.lineTo(w-PAD.r,mapY(v,0,1,PAD.t,h-PAD.b));ctx.stroke();
-    ctx.setLineDash([]);
-  }});
-  drawLine(ctx,BT,'proba','#eceff4',w,h,PAD,0,1,1.2);
-  // Dates
-  const step=Math.ceil(BT.length/8);
-  ctx.fillStyle='#546e7a';ctx.font='9px DM Mono';
-  BT.forEach((d,i)=>{{if(i%step===0){{
-    const x=PAD.l+(i/(BT.length-1))*(w-PAD.l-PAD.r);
-    ctx.fillText(d.date.slice(0,7),x-18,h-6);
-  }}}});
-}}
-
-// ── Prix ──────────────────────────────────────────────────
-function drawPrix(){{
-  const{{ctx,w,h}}=getCtx('prixChart',220);
-  const PAD={{l:60,r:20,t:12,b:30}};
-  const mn=Math.min(...BT.map(d=>d.prix))*0.99;
-  const mx=Math.max(...BT.map(d=>d.prix))*1.01;
-  drawGrid(ctx,w,h,PAD,mn,mx,5,'');
-  // Zones signal
-  BT.forEach((d,i)=>{{
-    if(i===BT.length-1)return;
+    if(!d.pos||i>=BT.length-1)return;
     const x1=PAD.l+(i/(BT.length-1))*(w-PAD.l-PAD.r);
     const x2=PAD.l+((i+1)/(BT.length-1))*(w-PAD.l-PAD.r);
-    const col=d.signal==='ACHAT'?'rgba(0,230,118,.08)':d.signal==='VENTE'?'rgba(255,23,68,.08)':null;
-    if(col){{ctx.fillStyle=col;ctx.fillRect(x1,PAD.t,x2-x1,h-PAD.t-PAD.b);}}
+    ctx.fillStyle='rgba(0,255,157,.06)';
+    ctx.fillRect(x1,PAD.t,x2-x1,h-PAD.t-PAD.b);
   }});
-  drawLine(ctx,BT,'prix','#eceff4',w,h,PAD,mn,mx,1.5);
+  drawLine(ctx,BT,'cum_bh','#0090ff',w,h,PAD,mn,mx,1.5);
+  drawLine(ctx,BT,'cum_strat','#00ff9d',w,h,PAD,mn,mx,2.2);
+  // Dates
   const step=Math.ceil(BT.length/8);
-  ctx.fillStyle='#546e7a';ctx.font='9px DM Mono';
+  ctx.fillStyle='#3d5a73'; ctx.font='9px IBM Plex Mono';
   BT.forEach((d,i)=>{{if(i%step===0){{
     const x=PAD.l+(i/(BT.length-1))*(w-PAD.l-PAD.r);
     ctx.fillText(d.date.slice(0,7),x-18,h-6);
   }}}});
-  // Prix
-  ctx.fillStyle='#546e7a';ctx.textAlign='right';
-  BT.forEach((d,i)=>{{if(i%Math.ceil(BT.length/5)===0){{
-    const y=mapY(d.prix,mn,mx,PAD.t,h-PAD.b);
-    ctx.fillText(d.prix.toFixed(0),PAD.l-4,y+3);
-  }}}});
-  ctx.textAlign='left';
 }}
 
-// ── Mensuel ───────────────────────────────────────────────
-function drawMonthly(){{
-  const grid=document.getElementById('monthGrid');
+function drawDD(){{
+  const{{ctx,w,h}}=getCtx('ddChart',160);
+  const PAD={{l:50,r:16,t:10,b:26}};
+  const mn=Math.min(...BT.map(d=>Math.min(d.dd_bh||0,d.dd_strat||0)))*1.1;
+  const mx=0;
+  drawGrid(ctx,w,h,PAD,mn,mx,4,'%');
+  const y0=mY(0,mn,mx,PAD.t,h-PAD.b);
+  // Fill
+  ctx.beginPath(); BT.forEach((d,i)=>{{
+    const x=PAD.l+(i/(BT.length-1))*(w-PAD.l-PAD.r);
+    i===0?ctx.moveTo(x,y0):ctx.lineTo(x,mY(d.dd_bh||0,mn,mx,PAD.t,h-PAD.b));
+  }});
+  ctx.fillStyle='rgba(0,144,255,.12)'; ctx.fill();
+  drawLine(ctx,BT,'dd_bh','#0090ff',w,h,PAD,mn,mx,1.2);
+  drawLine(ctx,BT,'dd_strat','#00ff9d',w,h,PAD,mn,mx,1.5);
+}}
+
+function drawProba(){{
+  const{{ctx,w,h}}=getCtx('probaChart',260);
+  const PAD={{l:50,r:16,t:12,b:30}};
+  drawGrid(ctx,w,h,PAD,0,1,4,'');
+  // Zones achat
+  BT.forEach((d,i)=>{{
+    if(!d.pos||i>=BT.length-1)return;
+    const x1=PAD.l+(i/(BT.length-1))*(w-PAD.l-PAD.r);
+    const x2=PAD.l+((i+1)/(BT.length-1))*(w-PAD.l-PAD.r);
+    ctx.fillStyle='rgba(0,255,157,.12)'; ctx.fillRect(x1,PAD.t,x2-x1,h-PAD.t-PAD.b);
+  }});
+  // Seuil
+  const ys=mY(SBEST,0,1,PAD.t,h-PAD.b);
+  ctx.strokeStyle='#00ff9d88'; ctx.lineWidth=1.5; ctx.setLineDash([5,5]);
+  ctx.beginPath(); ctx.moveTo(PAD.l,ys); ctx.lineTo(w-PAD.r,ys); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle='#00ff9d'; ctx.font='10px IBM Plex Mono';
+  ctx.fillText('Seuil '+SBEST.toFixed(2),PAD.l+4,ys-4);
+  // Proba line
+  drawLine(ctx,BT,'proba','#dde6f0',w,h,PAD,0,1,1.2);
+  // Dates
+  const step=Math.ceil(BT.length/8);
+  ctx.fillStyle='#3d5a73'; ctx.font='9px IBM Plex Mono';
+  BT.forEach((d,i)=>{{if(i%step===0){{
+    const x=PAD.l+(i/(BT.length-1))*(w-PAD.l-PAD.r);
+    ctx.fillText(d.date.slice(0,7),x-18,h-6);
+  }}}});
+}}
+
+function drawHist(){{
+  const{{ctx,w,h}}=getCtx('histChart',200);
+  const PAD={{l:50,r:16,t:16,b:30}};
+  const counts=HIST.counts; const edges=HIST.edges;
+  const maxC=Math.max(...counts);
+  ctx.fillStyle='#0a0f16'; ctx.fillRect(0,0,w,h);
+  const bw=(w-PAD.l-PAD.r)/counts.length;
+  counts.forEach((c,i)=>{{
+    const x=PAD.l+i*bw;
+    const h2=(c/maxC)*(h-PAD.t-PAD.b);
+    const mid=(edges[i]+edges[i+1])/2;
+    const col=mid>=SBEST?'#00ff9d99':'#3d5a73';
+    ctx.fillStyle=col;
+    ctx.fillRect(x+1,h-PAD.b-h2,bw-2,h2);
+  }});
+  // Axe
+  ctx.fillStyle='#3d5a73'; ctx.font='9px IBM Plex Mono';
+  [0,.25,.5,.75,1].forEach(v=>{{
+    const x=PAD.l+v*(w-PAD.l-PAD.r);
+    ctx.fillText(v.toFixed(2),x-10,h-6);
+  }});
+  // Seuil
+  const xs=PAD.l+SBEST*(w-PAD.l-PAD.r);
+  ctx.strokeStyle='#00ff9d'; ctx.lineWidth=2; ctx.setLineDash([4,4]);
+  ctx.beginPath(); ctx.moveTo(xs,PAD.t); ctx.lineTo(xs,h-PAD.b); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle='#00ff9d'; ctx.fillText('Seuil',xs+4,PAD.t+12);
+}}
+
+function drawSeuils(){{
+  const grid=document.getElementById('seuilGrid');
   grid.innerHTML='';
-  MON.forEach(m=>{{
-    const pos=m.ret_strat>=0;
-    const col=pos?'#00e676':'#ff1744';
-    grid.innerHTML+=`<div class="month-card">
-      <div class="mc-date">${{m.mois}}</div>
-      <div class="mc-ret" style="color:${{col}}">${{m.ret_strat>=0?'+':''}}${{m.ret_strat}}%</div>
-      <div class="mc-sub">BH : ${{m.ret_bh>=0?'+':''}}${{m.ret_bh}}%</div>
-      <div class="mc-sigs">
-        <span style="color:#00e676">▲${{m.n_achat}}</span>
-        <span style="color:#ff1744">▼${{m.n_vente}}</span>
+  SEUILS.forEach(s=>{{
+    const active=Math.abs(s.seuil-SBEST)<0.001?'active':'';
+    grid.innerHTML+=`<div class="seuil-btn ${{active}}" onclick="showSeuil(${{s.seuil}})">
+      <div class="sb-val">${{s.seuil.toFixed(2)}}</div>
+      <div class="sb-sub">Sharpe ${{s.sharpe.toFixed(2)}}</div>
+      <div class="sb-sub">Ret ${{s.ret.toFixed(1)}}%/an</div>
+    </div>`;
+  }});
+  showSeuil(SBEST);
+}}
+
+function showSeuil(s){{
+  const d=SEUILS.find(x=>Math.abs(x.seuil-s)<0.001);
+  if(!d)return;
+  document.querySelectorAll('.seuil-btn').forEach(b=>b.classList.remove('active'));
+  document.querySelectorAll('.seuil-btn').forEach(b=>{{
+    if(b.querySelector('.sb-val').textContent===s.toFixed(2)) b.classList.add('active');
+  }});
+  document.getElementById('seuilDetail').innerHTML=`
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:16px 0">
+      <div style="background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:16px;text-align:center">
+        <div style="font-size:9px;color:var(--muted);letter-spacing:1px">SHARPE</div>
+        <div style="font-size:22px;font-weight:800;color:${{d.sharpe>1?'var(--green)':'var(--yellow)'}}">${{d.sharpe.toFixed(3)}}</div>
+      </div>
+      <div style="background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:16px;text-align:center">
+        <div style="font-size:9px;color:var(--muted);letter-spacing:1px">RET ANN.</div>
+        <div style="font-size:22px;font-weight:800;color:${{d.ret>=0?'var(--green)':'var(--red)'}}">${{d.ret>=0?'+':''}}${{d.ret.toFixed(1)}}%</div>
+      </div>
+      <div style="background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:16px;text-align:center">
+        <div style="font-size:9px;color:var(--muted);letter-spacing:1px">MAX DD</div>
+        <div style="font-size:22px;font-weight:800;color:var(--red)">${{d.mdd.toFixed(1)}}%</div>
+      </div>
+      <div style="background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:16px;text-align:center">
+        <div style="font-size:9px;color:var(--muted);letter-spacing:1px">INVESTI</div>
+        <div style="font-size:22px;font-weight:800;color:var(--blue)">${{d.investi.toFixed(0)}}%</div>
       </div>
     </div>`;
+}}
+
+function drawSharpe(){{
+  const{{ctx,w,h}}=getCtx('sharpeChart',200);
+  const PAD={{l:50,r:16,t:16,b:30}};
+  const mn=Math.min(0,...SEUILS.map(s=>s.sharpe))-0.1;
+  const mx=Math.max(...SEUILS.map(s=>s.sharpe))+0.1;
+  drawGrid(ctx,w,h,PAD,mn,mx,4,'');
+  const bw=(w-PAD.l-PAD.r)/SEUILS.length;
+  SEUILS.forEach((s,i)=>{{
+    const x=PAD.l+i*bw;
+    const y0=mY(0,mn,mx,PAD.t,h-PAD.b);
+    const y1=mY(s.sharpe,mn,mx,PAD.t,h-PAD.b);
+    const active=Math.abs(s.seuil-SBEST)<0.001;
+    ctx.fillStyle=active?'#00ff9d':(s.sharpe>0?'#00ff9d66':'#ff2d5b66');
+    ctx.fillRect(x+2,Math.min(y0,y1),bw-4,Math.abs(y0-y1));
+    ctx.fillStyle='#3d5a73'; ctx.font='9px IBM Plex Mono';
+    ctx.fillText(s.seuil.toFixed(2),x+2,h-6);
   }});
 }}
 
-// Init
 window.addEventListener('load',()=>{{drawCum();drawDD();}});
 window.addEventListener('resize',()=>{{drawCum();drawDD();}});
 </script>
@@ -694,53 +635,49 @@ window.addEventListener('resize',()=>{{drawCum();drawDD();}});
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     print("=" * 55)
-    print("  BACKTEST — REGIME SWITCHING S&P 500")
+    print("  BACKTEST LONG ONLY — S&P 500")
     print("=" * 55)
 
-    print("\nChargement des données...")
-    df = charger_donnees()
-    print(f"  {len(df)} jours ({df.index[0].strftime('%Y-%m-%d')} → {df.index[-1].strftime('%Y-%m-%d')})")
+    df          = charger_donnees()
+    mod, params = charger_modele_hausse()
+    print(f"\nDataset : {len(df)}j ({df.index[0].strftime('%Y-%m-%d')} → {df.index[-1].strftime('%Y-%m-%d')})")
 
-    print("\nChargement des modèles...")
-    modeles, params = charger_modeles()
-    print(f"  {len(modeles)} modèles chargés : {list(modeles.keys())}")
+    print("\nCalcul des probabilités...")
+    probas = predire_historique(df, mod)
 
-    if not modeles:
-        print("  ⚠️  Lance d'abord : python 2_train_models_FINAL_V3.py")
-        exit()
+    print("\nBacktest multi-seuils...")
+    seuils   = [0.45, 0.50, 0.52, 0.55, 0.58, 0.60, 0.62, 0.65, 0.68, 0.70]
+    resultats = {}
 
-    print("\nPrédictions sur tout l'historique...")
-    df = predire_historique(df, modeles, params)
+    print(f"\n  {'Seuil':>6} | {'Ret Ann':>8} | {'Sharpe':>7} | {'MDD':>7} | {'Investis':>9}")
+    print(f"  {'─'*50}")
 
-    print("\nSimulation backtest (frais 0.1%)...")
-    bt = simuler_backtest(df, frais=0.001)
+    for seuil in seuils:
+        bt = backtest_seuil(df, probas, seuil)
+        m  = calculer_metriques(bt)
+        resultats[seuil] = {'bt': bt, 'metriques': m}
+        flag = " ← MEILLEUR SHARPE" if seuil == max(
+            resultats, key=lambda s: resultats[s]['metriques']['sharpe_strat']
+        ) else ""
+        print(f"  {seuil:>6.2f} | {m['ret_ann_strat']:>+7.2f}% | "
+              f"{m['sharpe_strat']:>7.3f} | {m['mdd_strat']:>6.1f}% | "
+              f"{m['jours_investis']:>8.1f}%{flag}")
 
-    print("\nCalcul des métriques...")
-    metriques = calculer_metriques(bt)
+    # Meilleur seuil selon Sharpe
+    seuil_best = max(resultats, key=lambda s: resultats[s]['metriques']['sharpe_strat'])
+    bt_best    = resultats[seuil_best]['bt']
+    m_best     = resultats[seuil_best]['metriques']
 
-    print("\n" + "=" * 55)
-    print("  RÉSULTATS")
-    print("=" * 55)
-    print(f"  Rendement Stratégie : {metriques['ret_total_strat']:+.1f}%")
-    print(f"  Rendement Buy&Hold  : {metriques['ret_total_bh']:+.1f}%")
-    print(f"  Sharpe Stratégie    : {metriques['sharpe_strat']}")
-    print(f"  Sharpe Buy&Hold     : {metriques['sharpe_bh']}")
-    print(f"  Max DD Stratégie    : {metriques['mdd_strat']:.1f}%")
-    print(f"  Max DD Buy&Hold     : {metriques['mdd_bh']:.1f}%")
-    print(f"  Win Rate            : {metriques['win_rate']}%")
+    print(f"\n  Seuil optimal : {seuil_best:.2f} (Sharpe={m_best['sharpe_strat']})")
+    afficher_resultats(seuil_best, m_best)
 
     print("\nGénération du rapport HTML...")
-    # Calcul drawdowns pour JSON
-    bt['dd_bh']    = (bt['cum_bh']    / bt['cum_bh'].cummax()    - 1) * 100
-    bt['dd_strat'] = (bt['cum_strat'] / bt['cum_strat'].cummax() - 1) * 100
-    bt_data   = preparer_json(bt, step=2)
+    resultats_m = {s: resultats[s]['metriques'] for s in resultats}
+    html = generer_html(resultats_m, bt_best, m_best, seuil_best, probas, df)
 
-    html = generer_html_backtest(metriques, bt_data, bt)
-
-    chemin = "outputs/backtest.html"
+    chemin = "outputs/backtest_long_only.html"
     with open(chemin, 'w', encoding='utf-8') as f:
         f.write(html)
 
-    print(f"\n  ✓ Rapport sauvegardé → {chemin}")
-    print(f"  Lance : start outputs\\backtest.html")
+    print(f"\n  ✓ Rapport → {chemin}")
     os.system(f'start "" "{os.path.abspath(chemin)}"')

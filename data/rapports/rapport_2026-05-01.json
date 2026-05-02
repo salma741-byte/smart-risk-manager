@@ -1,0 +1,103 @@
+{
+  "date_rapport": "2026-05-01 19:58:40",
+  "sp500": {
+    "stats_descriptives": {
+      "moyenne_journaliere": 0.000325,
+      "moyenne_annualisee": 0.0819,
+      "volatilite_journaliere": 0.012144,
+      "volatilite_annualisee": 0.1928,
+      "min": -0.1198,
+      "max": 0.1158,
+      "median": 0.000639,
+      "skewness": -0.1142,
+      "kurtosis": 10.6355,
+      "nb_jours_positifs": 3532,
+      "nb_jours_negatifs": 3037,
+      "pct_jours_positifs": 53.74
+    },
+    "drawdown": {
+      "drawdown_max_global": -0.5678,
+      "drawdown_max_1an": -0.0936,
+      "date_drawdown_max_global": "2009-03-09",
+      "drawdown_actuel": 0.0
+    },
+    "regime": {
+      "tendance": "BULL_FORT",
+      "signal_rsi": "SURACHETÉ",
+      "signal_vol": "NORMALE",
+      "signal_macd": "HAUSSIER",
+      "rsi_valeur": 80.11,
+      "ma_20": 6976.09,
+      "ma_50": 6814.55,
+      "ma_200": 6723.61,
+      "close": 7209.01,
+      "rendement_j": 1.0238,
+      "vol_20j_ann": 11.99
+    },
+    "risque_queues": {
+      "VaR_95_journalier": -1.8338,
+      "VaR_99_journalier": -3.4013,
+      "CVaR_95_journalier": -2.9065,
+      "CVaR_99_journalier": -4.9123,
+      "VaR_95_annualise": -29.1103,
+      "rendement_max_1j": 11.58,
+      "rendement_min_1j": -11.9841
+    },
+    "performances": {
+      "perf_5j": 0.61,
+      "perf_1m": 9.64,
+      "perf_3m": 3.89,
+      "perf_6m": 4.62,
+      "perf_1an": 29.45,
+      "perf_ytd": 5.11,
+      "sharpe_1an_actuel": 1.7441,
+      "sharpe_moyen_historique": 0.3705
+    }
+  },
+  "vix": {
+    "stats_descriptives": {
+      "moyenne_journaliere": 0.002601,
+      "moyenne_annualisee": 0.6555,
+      "volatilite_journaliere": 0.075444,
+      "volatilite_annualisee": 1.1976,
+      "min": -0.3575,
+      "max": 1.156,
+      "median": -0.005486,
+      "skewness": 2.0509,
+      "kurtosis": 16.5125,
+      "nb_jours_positifs": 3000,
+      "nb_jours_negatifs": 3540,
+      "pct_jours_positifs": 45.64
+    },
+    "regime": {
+      "tendance": "BEAR_MODERE",
+      "signal_rsi": "NEUTRE",
+      "signal_vol": "NORMALE",
+      "signal_macd": "BAISSIER",
+      "rsi_valeur": 37.5,
+      "ma_20": 19.23,
+      "ma_50": 22.24,
+      "ma_200": 18.28,
+      "close": 16.86,
+      "rendement_j": -0.1776,
+      "vol_20j_ann": 93.83
+    },
+    "performances": {
+      "perf_5j": -6.44,
+      "perf_1m": -29.37,
+      "perf_3m": 3.18,
+      "perf_6m": -0.3,
+      "perf_1an": -31.46,
+      "perf_ytd": 16.2,
+      "sharpe_1an_actuel": 0.2182,
+      "sharpe_moyen_historique": 0.447
+    }
+  },
+  "correlation_sp500_vix": {
+    "correlation_globale": -0.7184,
+    "correlation_1an": -0.8455,
+    "correlation_3m": -0.8413,
+    "signal_stress": "ÉLEVÉ — forte corrélation inverse (panique)",
+    "nb_jours_communs": 6572
+  }
+}

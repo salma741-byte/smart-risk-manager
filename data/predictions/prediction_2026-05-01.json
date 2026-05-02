@@ -1,0 +1,112 @@
+{
+  "date": "2026-05-01",
+  "prediction_j1": {
+    "date_prediction": "2026-05-01",
+    "date_cible": "2026-05-01",
+    "direction": "BAISSE",
+    "proba_hausse": 49.48,
+    "proba_baisse": 50.52,
+    "confiance": "FAIBLE",
+    "signal": "⏸️  NEUTRE — Signal incertain",
+    "close_reference": 7209.01,
+    "rendement_hier": 1.0238,
+    "rsi_actuel": 80.11,
+    "vix_actuel": 16.89
+  },
+  "performance_holdout": {
+    "accuracy": 0.4333,
+    "precision": 0.4634,
+    "recall": 0.6129,
+    "auc_roc": 0.3838,
+    "train_size": 5809,
+    "test_size": 60,
+    "periode_test_debut": "2026-02-04",
+    "periode_test_fin": "2026-04-30",
+    "confusion_matrix": [
+      [
+        7,
+        22
+      ],
+      [
+        12,
+        19
+      ]
+    ]
+  },
+  "walk_forward": {
+    "splits": [
+      {
+        "fold": 1,
+        "train_start": "2003-01-02",
+        "train_end": "2021-04-23",
+        "test_start": "2021-04-26",
+        "test_end": "2022-04-22",
+        "accuracy": 0.5238,
+        "auc_roc": 0.5261
+      },
+      {
+        "fold": 2,
+        "train_start": "2003-01-02",
+        "train_end": "2022-04-22",
+        "test_start": "2022-04-25",
+        "test_end": "2023-04-25",
+        "accuracy": 0.5119,
+        "auc_roc": 0.5262
+      },
+      {
+        "fold": 3,
+        "train_start": "2003-01-02",
+        "train_end": "2023-04-25",
+        "test_start": "2023-04-26",
+        "test_end": "2024-04-25",
+        "accuracy": 0.5635,
+        "auc_roc": 0.5535
+      },
+      {
+        "fold": 4,
+        "train_start": "2003-01-02",
+        "train_end": "2024-04-25",
+        "test_start": "2024-04-26",
+        "test_end": "2025-04-29",
+        "accuracy": 0.5437,
+        "auc_roc": 0.5011
+      },
+      {
+        "fold": 5,
+        "train_start": "2003-01-02",
+        "train_end": "2025-04-29",
+        "test_start": "2025-04-30",
+        "test_end": "2026-04-30",
+        "accuracy": 0.5198,
+        "auc_roc": 0.4878
+      }
+    ],
+    "accuracy_mean": 0.5325,
+    "accuracy_std": 0.0187,
+    "auc_mean": 0.5189,
+    "auc_std": 0.0227
+  },
+  "feature_importance": {
+    "effet_vendredi": 0.034005433320999146,
+    "rendement": 0.030537808313965797,
+    "dist_ma50": 0.030351456254720688,
+    "momentum_10j": 0.030075524002313614,
+    "streak_baissier": 0.030032776296138763,
+    "rsi_centre": 0.029789742082357407,
+    "vix_lag_1": 0.029596244916319847,
+    "rsi": 0.02938726358115673,
+    "ret_lag_3": 0.029259242117404938,
+    "momentum_5j": 0.029199756681919098,
+    "vix_lag_2": 0.02893967181444168,
+    "ret_lag_21": 0.02888024039566517,
+    "macd_hist": 0.02881629206240177,
+    "vol_20j": 0.028768649324774742,
+    "vix_change": 0.028555644676089287,
+    "effet_lundi": 0.028300566598773003,
+    "ret_lag_5": 0.028211859986186028,
+    "vol_5j": 0.028155969455838203,
+    "momentum_21j": 0.028073443099856377,
+    "vix_niveau": 0.027894873172044754
+  },
+  "modele": "Ensemble XGBoost(x3) + RandomForest(x2) + LogisticRegression(x1)"
+}
