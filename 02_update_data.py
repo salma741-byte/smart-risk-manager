@@ -10,7 +10,7 @@ DB_PATH = "data/market_data.db"
 actifs = {
     'sp500': '^GSPC',
     'vix'  : '^VIX',
-    'btc'  : 'BTC-USD'
+    
 }
 
 def get_connection():
