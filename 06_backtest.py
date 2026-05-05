@@ -66,16 +66,26 @@ def predire_historique(df, mod):
 # ─────────────────────────────────────────
 # 3. BACKTEST MULTI-SEUILS
 # ─────────────────────────────────────────
-def backtest_seuil(df, probas, seuil, frais=0.001):
+def position_avec_holding(probas, seuil, holding=10):
+    pos = np.zeros(len(probas))
+    jours_restants = 0
+    for i in range(1, len(probas)):
+        if probas[i-1] >= seuil:
+            jours_restants = holding
+        if jours_restants > 0:
+            pos[i] = 1
+            jours_restants -= 1
+    return pos
+
+def backtest_seuil(df, probas, seuil, frais=0.001, holding=10):
     bt = df[['close']].copy()
     bt['ret_daily'] = bt['close'].pct_change()
     bt['proba']     = probas
 
-    # Position : 1 si signal, 0 sinon (décalée d'1 jour)
-    bt['position']  = (bt['proba'].shift(1) >= seuil).astype(float)
-    bt['pos_change']= bt['position'].diff().abs().fillna(0)
-    bt['frais_app'] = bt['pos_change'] * frais
-    bt['ret_strat'] = bt['position'] * bt['ret_daily'] - bt['frais_app']
+    bt['position']   = position_avec_holding(probas, seuil, holding)
+    bt['pos_change'] = bt['position'].diff().abs().fillna(0)
+    bt['frais_app']  = bt['pos_change'] * frais
+    bt['ret_strat']  = bt['position'] * bt['ret_daily'] - bt['frais_app']
 
     bt.dropna(inplace=True)
     bt['cum_bh']    = (1 + bt['ret_daily']).cumprod()
