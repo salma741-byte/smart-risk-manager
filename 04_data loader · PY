@@ -1,13 +1,12 @@
 # ============================================================
-#  1b_features_regime_FINAL.py — VERSION FINALE SANS BTC
-#  Données : S&P500 + VIX uniquement
+#  1b_features_regime_FINAL.py — VERSION COMPLÈTE
+#  Données : S&P500 + VIX + Gold + DXY + Bitcoin
 #  Lance ce fichier AVANT 2_train_models_FINAL.py
 # ============================================================
 
 import pandas as pd
 import numpy as np
 import sqlite3
-import requests
 import warnings
 warnings.filterwarnings('ignore')
 import os
@@ -21,17 +20,16 @@ def calculer_rsi(serie, periode=14):
     rs    = gain / loss
     return 100 - (100 / (1 + rs))
 
-# ─────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────
 # FEATURES RÉGIME CALME
-# Le prix suit des tendances claires
-# On étudie : direction, momentum, retour à la moyenne
-# ─────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 def ajouter_features_calme(df):
     high  = df['high']
     low   = df['low']
     close = df['close']
 
-    # ── ADX — force de la tendance ───────────────────────────────
+    # ADX
     plus_dm  = (high.diff()).clip(lower=0)
     minus_dm = (-low.diff()).clip(lower=0)
     plus_dm  = plus_dm.where(plus_dm > minus_dm, 0)
@@ -48,28 +46,28 @@ def ajouter_features_calme(df):
     df['minus_di']  = minus_di
     df['di_signal'] = (df['plus_di'] > df['minus_di']).astype(int)
 
-    # ── ROC — vitesse de variation du prix ───────────────────────
+    # ROC
     df['roc_5']  = close.pct_change(5)  * 100
     df['roc_10'] = close.pct_change(10) * 100
     df['roc_20'] = close.pct_change(20) * 100
     df['momentum_accel'] = df['roc_5'] - df['roc_10'] / 2
 
-    # ── Z-scores — retour à la moyenne ──────────────────────────
+    # Z-scores
     for p in [20, 50, 200]:
         ma  = close.rolling(p).mean()
         std = close.rolling(p).std()
         df[f'zscore_{p}'] = (close - ma) / std
 
-    # ── Cassures de niveaux ──────────────────────────────────────
+    # Cassures
     df['breakout_20d']  = (close > close.rolling(20).max().shift(1)).astype(int)
     df['breakout_50d']  = (close > close.rolling(50).max().shift(1)).astype(int)
     df['breakdown_20d'] = (close < close.rolling(20).min().shift(1)).astype(int)
 
-    # ── Pentes des moyennes mobiles ──────────────────────────────
+    # Pentes MA
     df['ma20_pente'] = close.rolling(20).mean().pct_change(5)
     df['ma50_pente'] = close.rolling(50).mean().pct_change(10)
 
-    # ── Volume confirme le mouvement ────────────────────────────
+    # Volume
     if 'ret_1d' in df.columns and 'vol_ratio' in df.columns:
         df['volume_price_trend'] = (df['ret_1d'] * df['vol_ratio']).rolling(5).sum()
     else:
@@ -78,35 +76,34 @@ def ajouter_features_calme(df):
     print("  ✓ Features CALME : ADX, ROC, Z-scores, Breakouts, Pentes MA, Volume")
     return df
 
-# ─────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────
 # FEATURES RÉGIME STRESSÉ
-# Le prix chute vite avec panique
-# On étudie : vitesse chute, panique, rebonds
-# ─────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 def ajouter_features_stress(df):
     close = df['close']
     high  = df['high']
     low   = df['low']
 
-    # ── Vitesse et ampleur de la chute ──────────────────────────
+    # Vitesse et ampleur de la chute
     df['drawdown_20d'] = (close / close.rolling(20).max() - 1) * 100
     df['drawdown_50d'] = (close / close.rolling(50).max() - 1) * 100
     df['chute_accel']  = close.pct_change().rolling(3).mean()
 
-    # ── Panique et survente ──────────────────────────────────────
+    # Panique et survente
     df['rsi_2']        = calculer_rsi(close, 2)
     df['rsi_oversold'] = (df['rsi_2'] < 10).astype(int)
-    highest_high = high.rolling(14).max()
-    lowest_low   = low.rolling(14).min()
-    df['williams_r'] = -100 * (highest_high - close) / (highest_high - lowest_low)
+    highest_high       = high.rolling(14).max()
+    lowest_low         = low.rolling(14).min()
+    df['williams_r']   = -100 * (highest_high - close) / (highest_high - lowest_low)
 
-    # ── Rebond technique dans la baisse ─────────────────────────
+    # Rebond
     df['rebond_1d'] = (close > close.shift(1)).astype(int)
     df['rebond_apres_chute'] = (
         (df['rebond_1d'] == 1) & (close.pct_change(3) < -0.02)
     ).astype(int)
 
-    # ── VIX features ────────────────────────────────────────────
+    # VIX
     if 'vix_close' in df.columns:
         df['vix_spike']   = df['vix_close'] / df['vix_close'].rolling(20).mean() - 1
         df['vix_extreme'] = (df['vix_close'] > 30).astype(int)
@@ -115,18 +112,12 @@ def ajouter_features_stress(df):
             (df['vix_close'] > 25)
         ).astype(int)
 
-    # ── Features SP500 pures (remplace BTC) ─────────────────────
-    # Ratio Haut/Bas — mesure la pression vendeuse intraday
+    # SP500 pur
     df['high_low_ratio'] = (high - low) / close
-
-    # Gap d'ouverture — sentiment overnight
-    df['gap_ouverture'] = (df['open'] - close.shift(1)) / close.shift(1)
-    df['gap_negatif']   = (df['gap_ouverture'] < -0.005).astype(int)
-
-    # Close position dans le range du jour (1=force, 0=faiblesse)
+    df['gap_ouverture']  = (df['open'] - close.shift(1)) / close.shift(1)
+    df['gap_negatif']    = (df['gap_ouverture'] < -0.005).astype(int)
     df['close_position'] = (close - low) / (high - low)
 
-    # Divergence SP500/VIX — vraie panique si les deux bougent ensemble
     if 'vix_ret_1d' in df.columns:
         df['sp_vix_divergence'] = df['ret_1d'] + df['vix_ret_1d']
 
@@ -147,49 +138,142 @@ def ajouter_features_stress(df):
     print("  ✓ Features STRESSÉ : Drawdown, Williams%R, VIX, Gap, Close position, Chandeliers")
     return df
 
-# ─────────────────────────────────────────
-# FEATURES MACRO
-# ─────────────────────────────────────────
-def ajouter_features_macro(df):
-    # ── Fear & Greed Index ───────────────────────────────────────
-    try:
-        url = "https://api.alternative.me/fng/?limit=2000&format=json"
-        r   = requests.get(url, timeout=10).json()
-        fg  = pd.DataFrame(r['data'])
-        fg['date']     = pd.to_datetime(fg['timestamp'].astype(int), unit='s').dt.normalize()
-        fg['fg_index'] = fg['value'].astype(float)
-        fg  = fg.set_index('date')[['fg_index']].sort_index()
-        fg  = fg[~fg.index.duplicated()]
-        df  = df.join(fg, how='left')
-        df['fg_index'] = df['fg_index'].ffill().fillna(50)
-        df['fg_change_5d']     = df['fg_index'].diff(5)
-        df['fg_extreme_fear']  = (df['fg_index'] < 25).astype(int)
-        df['fg_extreme_greed'] = (df['fg_index'] > 75).astype(int)
-        df['fg_zscore'] = (
-            (df['fg_index'] - df['fg_index'].rolling(30).mean()) /
-            df['fg_index'].rolling(30).std()
-        )
-        print("  ✓ Fear & Greed Index chargé")
-    except Exception as e:
-        print(f"  ⚠️  Fear & Greed non disponible ({e})")
-        for col in ['fg_index','fg_change_5d','fg_extreme_fear',
-                    'fg_extreme_greed','fg_zscore']:
-            df[col] = 0
-        df['fg_index'] = 50
 
-    # ── Saisonnalité ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# FEAR & GREED SYNTHÉTIQUE
+# ─────────────────────────────────────────────────────────────
+def _fear_greed_synthetique(df):
+    scores = pd.DataFrame(index=df.index)
+
+    ma125 = df['close'].rolling(125).mean()
+    mom   = (df['close'] - ma125) / ma125 * 100
+    scores['momentum'] = (mom.rank(pct=True) * 100).clip(0, 100)
+
+    if 'vix_close' in df.columns:
+        vix_inv = 100 - df['vix_close'].rank(pct=True) * 100
+        scores['vix_inv'] = vix_inv.clip(0, 100)
+    else:
+        scores['vix_inv'] = 50
+
+    vol_up    = df['volume'].where(df['close'] > df['close'].shift(1), 0)
+    vol_down  = df['volume'].where(df['close'] < df['close'].shift(1), 0)
+    vol_ratio = vol_up.rolling(20).sum() / (
+                vol_up.rolling(20).sum() +
+                vol_down.rolling(20).sum() + 1e-9)
+    scores['vol_breadth'] = (vol_ratio * 100).clip(0, 100)
+
+    scores['rsi_score'] = df['rsi_14'].clip(0, 100) if 'rsi_14' in df.columns else 50
+
+    if 'bb_zscore' in df.columns:
+        bb_pct = (df['bb_zscore'] + 2) / 4 * 100
+        scores['bb_score'] = bb_pct.clip(0, 100)
+    else:
+        scores['bb_score'] = 50
+
+    fg = (scores['momentum']    * 0.25 +
+          scores['vix_inv']     * 0.25 +
+          scores['vol_breadth'] * 0.20 +
+          scores['rsi_score']   * 0.15 +
+          scores['bb_score']    * 0.15)
+
+    return fg.clip(0, 100).round(1)
+
+
+# ─────────────────────────────────────────────────────────────
+# FEATURES MACRO + CROSS-ASSETS (Gold, DXY, Bitcoin)
+# ─────────────────────────────────────────────────────────────
+def ajouter_features_macro(df):
+
+    # Fear & Greed synthétique
+    df['fg_index']         = _fear_greed_synthetique(df)
+    df['fg_index']         = df['fg_index'].shift(1)
+    df['fg_change_5d']     = df['fg_index'].diff(5)
+    df['fg_extreme_fear']  = (df['fg_index'] < 25).astype(int)
+    df['fg_extreme_greed'] = (df['fg_index'] > 75).astype(int)
+    df['fg_zscore']        = (
+        (df['fg_index'] - df['fg_index'].rolling(30).mean()) /
+        df['fg_index'].rolling(30).std()
+    )
+    print("  ✓ Fear & Greed SYNTHÉTIQUE calculé (2000→2026)")
+
+    # ── GOLD ─────────────────────────────────────────────────────
+    try:
+        conn_g = sqlite3.connect(DB_PATH)
+        gold   = pd.read_sql(
+            "SELECT date, close as gold_close FROM gold_prices ORDER BY date",
+            conn_g, index_col='date', parse_dates=['date'])
+        conn_g.close()
+
+        df = df.join(gold[['gold_close']], how='left')
+        df['gold_close']      = df['gold_close'].ffill()
+        df['gold_ret_1d']     = df['gold_close'].pct_change(1)
+        df['gold_ret_5d']     = df['gold_close'].pct_change(5)
+        df['gold_vs_sp500']   = df['gold_ret_5d'] - df['ret_5d']
+        df['risk_off_signal'] = (df['gold_vs_sp500'] > 0.02).astype(int)
+        df['gold_ma20']       = df['gold_close'].rolling(20).mean()
+        df['gold_trend']      = (df['gold_close'] > df['gold_ma20']).astype(int)
+        print("  ✓ Gold features ajoutées")
+    except Exception as e:
+        print(f"  ⚠ Gold absent : {e}")
+        for col in ['gold_ret_1d', 'gold_ret_5d', 'gold_vs_sp500',
+                    'risk_off_signal', 'gold_trend']:
+            df[col] = 0
+
+    # ── DXY ──────────────────────────────────────────────────────
+    try:
+        conn_d = sqlite3.connect(DB_PATH)
+        dxy    = pd.read_sql(
+            "SELECT date, close as dxy_close FROM dxy_prices ORDER BY date",
+            conn_d, index_col='date', parse_dates=['date'])
+        conn_d.close()
+
+        df = df.join(dxy[['dxy_close']], how='left')
+        df['dxy_close']    = df['dxy_close'].ffill()
+        df['dxy_ret_1d']   = df['dxy_close'].pct_change(1)
+        df['dxy_ret_5d']   = df['dxy_close'].pct_change(5)
+        df['dxy_strength'] = (df['dxy_close'] >
+                               df['dxy_close'].rolling(20).mean()).astype(int)
+        df['dxy_spike']    = (df['dxy_ret_1d'] > 0.005).astype(int)
+        print("  ✓ DXY features ajoutées")
+    except Exception as e:
+        print(f"  ⚠ DXY absent : {e}")
+        for col in ['dxy_ret_1d', 'dxy_ret_5d', 'dxy_strength', 'dxy_spike']:
+            df[col] = 0
+
+    # ── BITCOIN ──────────────────────────────────────────────────
+    try:
+        conn_b = sqlite3.connect(DB_PATH)
+        btc    = pd.read_sql(
+            "SELECT date, close as btc_close FROM bitcoin_prices ORDER BY date",
+            conn_b, index_col='date', parse_dates=['date'])
+        conn_b.close()
+
+        df = df.join(btc[['btc_close']], how='left')
+        df['btc_close']    = df['btc_close'].ffill()
+        df['btc_ret_1d']   = df['btc_close'].pct_change(1)
+        df['btc_ret_5d']   = df['btc_close'].pct_change(5)
+        df['btc_corr_20d'] = df['ret_1d'].rolling(20).corr(df['btc_ret_1d'])
+        df['risk_on_btc']  = (df['btc_ret_5d'] > 0.03).astype(int)
+        print("  ✓ Bitcoin features ajoutées")
+    except Exception as e:
+        print(f"  ⚠ Bitcoin absent : {e}")
+        for col in ['btc_ret_1d', 'btc_ret_5d', 'btc_corr_20d', 'risk_on_btc']:
+            df[col] = 0
+
+    # Saisonnalité
     df['is_january']  = (df.index.month == 1).astype(int)
     df['is_may_oct']  = df.index.month.isin([5,6,7,8,9,10]).astype(int)
     df['is_q4_rally'] = df.index.month.isin([11,12]).astype(int)
     df['debut_mois']  = (df.index.day <= 5).astype(int)
     df['fin_mois']    = (df.index.day >= 25).astype(int)
 
-    # ── VIX percentile historique ────────────────────────────────
+    # VIX percentile
     if 'vix_close' in df.columns:
         df['vix_pct_rank']       = df['vix_close'].rolling(252).rank(pct=True)
-        df['vix_mean_reversion'] = df['vix_close'] / df['vix_close'].rolling(252).mean() - 1
+        df['vix_mean_reversion'] = (df['vix_close'] /
+                                    df['vix_close'].rolling(252).mean() - 1)
 
-    # ── Momentum multi-timeframe ─────────────────────────────────
+    # Momentum multi-timeframe
     close = df['close']
     df['momentum_coherent'] = (
         (close > close.shift(1)).astype(int) +
@@ -197,7 +281,7 @@ def ajouter_features_macro(df):
         (close > close.shift(20)).astype(int)
     )
 
-    # ── Pente de régression linéaire rolling ────────────────────
+    # Pente régression rolling
     def rolling_slope(serie, window):
         x      = np.arange(window)
         slopes = [np.nan] * (window - 1)
@@ -213,36 +297,43 @@ def ajouter_features_macro(df):
     df['tendance_slope_20'] = rolling_slope(close, 20)
     df['tendance_slope_5']  = rolling_slope(close, 5)
 
-    print("  ✓ Features macro : Fear&Greed, Saisonnalité, Momentum MTF, Régression")
+    print("  ✓ Features macro : FG synthétique, Saisonnalité, Gold, DXY, BTC, Momentum MTF")
     return df
 
-# ─────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────
 # LISTES DE FEATURES PAR RÉGIME
-# ─────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 FEATURES_CALME = [
-    # Les 8 features qui ont le plus d'importance → on les garde
+    # Core techniques
     'di_signal', 'macd_hist', 'zscore_20', 'zscore_50',
     'prix_vs_ma50', 'rsi_14', 'fg_change_5d', 'vix_pct_rank',
-
-    # On ajoute des features de confirmation
-    'adx_14',            # force de la tendance
-    'tendance_slope_20', # direction générale
-    'momentum_coherent', # cohérence multi-timeframe
-    'breakout_20d',      # cassure haussière
-    'breakdown_20d',     # cassure baissière
-    'vol_ratio',         # volume confirme
+    # Tendance
+    'adx_14', 'tendance_slope_20', 'momentum_coherent',
+    'breakout_20d', 'breakdown_20d', 'vol_ratio',
+    # Rendements
     'ret_1d', 'ret_3d', 'ret_5d',
+    # Indicateurs
     'rsi_7', 'bb_zscore',
+    # Saisonnalité
     'is_january', 'is_q4_rally', 'day_of_week',
+    # Sentiment
     'fg_index', 'fg_extreme_fear', 'fg_extreme_greed',
+    # Cross-assets (nouveaux)
+    'gold_trend', 'risk_off_signal',
+    'dxy_strength', 'dxy_ret_1d',
+    'risk_on_btc', 'btc_corr_20d',
+    # VIX
+    'delta_vix', 'vix_pct_rank', 'rolling_corr_sp_vix',
+    'zscore_price_60d',
 ]
 
 FEATURES_STRESS = [
-    # Vitesse et ampleur de la chute
-    'drawdown_20d', 'drawdown_50d', 'chute_accel',
-    'tendance_slope_5',
-    # Panique et survente
+    # Chute
+    'drawdown_20d', 'drawdown_50d', 'chute_accel', 'tendance_slope_5',
+    # Panique
     'rsi_2', 'rsi_oversold', 'williams_r',
+    # Sentiment
     'fg_index', 'fg_extreme_fear', 'fg_change_5d',
     # Rebonds
     'rebond_apres_chute', 'jours_baisse_consecutifs',
@@ -250,29 +341,37 @@ FEATURES_STRESS = [
     # VIX
     'vix_spike', 'vix_extreme', 'vix_retour',
     'vix_close', 'vix_ret_1d', 'vix_mean_reversion', 'vix_pct_rank',
-    # SP500 pur (remplace BTC)
+    # SP500 micro-structure
     'high_low_ratio', 'gap_ouverture', 'gap_negatif',
     'close_position', 'sp_vix_divergence',
     # Momentum
     'momentum_coherent', 'ret_1d', 'ret_3d',
     'vol_20d', 'atr_pct', 'bb_zscore', 'rsi_7',
+    # Cross-assets stress (nouveaux — très importants en crise)
+    'gold_ret_1d', 'gold_vs_sp500', 'risk_off_signal',
+    'dxy_ret_1d', 'dxy_spike',
+    'btc_ret_1d', 'btc_corr_20d',
+    # Delta VIX
+    'delta_vix', 'rolling_corr_sp_vix', 'zscore_price_60d',
 ]
 
-# ─────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────
 # PIPELINE PRINCIPAL
-# ─────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 def construire_features_completes():
     conn = sqlite3.connect(DB_PATH)
-    sp  = pd.read_sql("SELECT * FROM sp500_prices", conn,
-                       index_col='date', parse_dates=['date'])
-    vix = pd.read_sql("SELECT date, close AS vix_close FROM vix_prices",
-                       conn, index_col='date', parse_dates=['date'])
+    sp   = pd.read_sql("SELECT * FROM sp500_prices ORDER BY date",
+                        conn, index_col='date', parse_dates=['date'])
+    vix  = pd.read_sql(
+        "SELECT date, close AS vix_close FROM vix_prices ORDER BY date",
+        conn, index_col='date', parse_dates=['date'])
     conn.close()
 
     sp.columns = [c.lower() for c in sp.columns]
     df = sp[['open','high','low','close','volume']].copy()
 
-    # ── Features de base SP500 ───────────────────────────────────
+    # Features de base SP500
     df['ret_1d']  = df['close'].pct_change(1)
     df['ret_3d']  = df['close'].pct_change(3)
     df['ret_5d']  = df['close'].pct_change(5)
@@ -323,39 +422,37 @@ def construire_features_completes():
     df['day_of_week'] = df.index.dayofweek
     df['month']       = df.index.month
 
-    # ── VIX uniquement (pas de BTC) ──────────────────────────────
+    # VIX
     df = df.join(vix[['vix_close']], how='left')
+    df['vix_close']   = df['vix_close'].ffill()
     df['vix_ret_1d']  = df['vix_close'].pct_change(1)
     df['vix_ret_5d']  = df['vix_close'].pct_change(5)
     df['vix_ma10']    = df['vix_close'].rolling(10).mean()
     df['vix_vs_ma10'] = df['vix_close'] / df['vix_ma10'] - 1
 
-    # ── Features par régime ──────────────────────────────────────
+    # Features par régime
     print("\nAjout features régime CALME...")
     df = ajouter_features_calme(df)
     print("Ajout features régime STRESSÉ...")
     df = ajouter_features_stress(df)
-    print("Ajout features macro...")
+    print("Ajout features macro + cross-assets...")
     df = ajouter_features_macro(df)
 
-    # ── Cible J+5 (+0.5% minimum) ───────────────────────────────
-    # Création du target basé sur mouvement significatif
+    # Cible J+5
     df['return_5j'] = df['close'].pct_change(5).shift(-5)
-    df['target'] = np.nan
+    df['target']    = np.nan
+    df.loc[df['return_5j'] >  0.015, 'target'] = 1
+    df.loc[df['return_5j'] < -0.008, 'target'] = 0
 
-    df.loc[df['return_5j'] > 0.01,  'target'] = 1   # hausse forte
-    df.loc[df['return_5j'] < -0.01, 'target'] = 0   # baisse forte
-
-# Supprimer les cas neutres (bruit)
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
-    df = df.ffill()          # jamais bfill sur features
+    df = df.ffill()
     df = df.dropna(subset=['target'])
     df.dropna(inplace=True)
 
     print(f"\n  Dataset final : {len(df)} lignes, {df.shape[1]} colonnes")
     print(f"  Balance cible : {df['target'].mean()*100:.1f}% hausse sur 5j")
 
-    # Sauvegarde SQLite
+    # Sauvegarde
     conn = sqlite3.connect(DB_PATH)
     df.to_sql("sp500_ml_features", conn,
               if_exists='replace', index=True, index_label='date')
@@ -373,35 +470,9 @@ def construire_features_completes():
 
 if __name__ == "__main__":
     print("=" * 55)
-    print("  FEATURES SP500+VIX — VERSION FINALE SANS BTC")
+    print("  FEATURES COMPLÈTES — SP500 + VIX + GOLD + DXY + BTC")
     print("=" * 55)
     os.makedirs("data",   exist_ok=True)
     os.makedirs("models", exist_ok=True)
     df = construire_features_completes()
     print("\nRelance : python 2_train_models_FINAL.py")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

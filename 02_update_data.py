@@ -8,11 +8,12 @@ from datetime import datetime, timedelta
 DB_PATH = "data/market_data.db"
 
 actifs = {
-    'sp500': '^GSPC',
-    'vix'  : '^VIX',
-    
+    'sp500'  : '^GSPC',
+    'vix'    : '^VIX',
+    'bitcoin': 'BTC-USD',
+    'gold'   : 'GC=F',
+    'dxy'    : 'DX-Y.NYB'
 }
-
 def get_connection():
     return sqlite3.connect(DB_PATH)
 

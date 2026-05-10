@@ -1,418 +1,853 @@
 # ============================================================
-#  5_chart_signal.py — GRAPHIQUE DE CONFIRMATION DU SIGNAL
-#  Affiche le S&P500 avec tous les indicateurs pour valider
-#  la décision ACHAT / VENTE / NEUTRE
+#  5_shap_analysis.py — ANALYSE SHAP COMPLÈTE
+#  Feature Importance par régime : CALME + STRESS
+#
+#  Graphes générés :
+#    01_shap_summary_calme.png      — beeswarm plot
+#    02_shap_summary_stress.png     — beeswarm plot
+#    03_shap_bar_comparaison.png    — importance comparée
+#    04_shap_dependence_top5.png    — effets partiels
+#    05_shap_waterfall_today.png    — explication signal aujourd'hui
+#    06_shap_heatmap_time.png       — SHAP dans le temps
 # ============================================================
 
-import pandas as pd
+import warnings
+warnings.filterwarnings('ignore')
+
 import numpy as np
+import pandas as pd
 import sqlite3
 import joblib
+import os
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
-import matplotlib.patches as mpatches
-from matplotlib.lines import Line2D
-import warnings
-warnings.filterwarnings('ignore')
-import os
+from matplotlib.colors import LinearSegmentedColormap
+import matplotlib.ticker as mticker
 
-os.makedirs("outputs", exist_ok=True)
-DB_PATH   = "data/market_data.db"
-N_JOURS   = 120   # nb de jours à afficher
+try:
+    import shap
+except ImportError:
+    import subprocess, sys
+    subprocess.check_call([sys.executable, '-m', 'pip',
+                           'install', 'shap', '-q'])
+    import shap
 
-COULEURS = {
-    'bg':      '#0d1117',
-    'bg2':     '#161b22',
-    'border':  '#21262d',
-    'green':   '#2ecc71',
-    'red':     '#e74c3c',
-    'yellow':  '#f1c40f',
-    'blue':    '#3498db',
-    'purple':  '#9b59b6',
-    'cyan':    '#1abc9c',
-    'text':    '#e6edf3',
-    'muted':   '#7d8590',
-    'orange':  '#e67e22',
-}
+DB_PATH = "data/market_data.db"
+OUT_DIR = "results/shap"
+os.makedirs(OUT_DIR, exist_ok=True)
 
-def style_dark():
+# ── Thème Bloomberg Dark ──────────────────────────────────────
+BG     = "#0a0e1a"
+BG2    = "#111827"
+BG3    = "#1c2537"
+GRID   = "#1e2d45"
+TEXT   = "#e2e8f0"
+TEXT2  = "#94a3b8"
+ORANGE = "#f97316"
+BLUE   = "#3b82f6"
+GREEN  = "#22c55e"
+RED    = "#ef4444"
+PURPLE = "#a855f7"
+CYAN   = "#06b6d4"
+YELLOW = "#eab308"
+
+def setup_theme():
     plt.rcParams.update({
-        'figure.facecolor':  COULEURS['bg'],
-        'axes.facecolor':    COULEURS['bg2'],
-        'axes.edgecolor':    COULEURS['border'],
-        'axes.labelcolor':   COULEURS['text'],
-        'xtick.color':       COULEURS['text'],
-        'ytick.color':       COULEURS['text'],
-        'grid.color':        COULEURS['border'],
-        'text.color':        COULEURS['text'],
-        'legend.facecolor':  COULEURS['bg'],
-        'legend.edgecolor':  COULEURS['border'],
-        'font.family':       'monospace',
-        'font.size':         9,
+        'figure.facecolor' : BG,
+        'axes.facecolor'   : BG2,
+        'axes.edgecolor'   : GRID,
+        'axes.labelcolor'  : TEXT2,
+        'axes.titlecolor'  : TEXT,
+        'axes.titlesize'   : 11,
+        'axes.labelsize'   : 9,
+        'axes.titlepad'    : 12,
+        'axes.spines.top'  : False,
+        'axes.spines.right': False,
+        'axes.grid'        : True,
+        'grid.color'       : GRID,
+        'grid.linewidth'   : 0.5,
+        'grid.alpha'       : 0.5,
+        'xtick.color'      : TEXT2,
+        'ytick.color'      : TEXT2,
+        'xtick.labelsize'  : 8,
+        'ytick.labelsize'  : 8,
+        'legend.facecolor' : BG3,
+        'legend.edgecolor' : GRID,
+        'legend.labelcolor': TEXT,
+        'legend.fontsize'  : 8,
+        'text.color'       : TEXT,
+        'font.family'      : 'monospace',
+        'lines.linewidth'  : 1.4,
+        'figure.dpi'       : 150,
     })
 
-# ─────────────────────────────────────────
-# 1. CHARGER LES DONNÉES
-# ─────────────────────────────────────────
-def charger_donnees(n_jours=N_JOURS):
+def sauvegarder(fig, nom):
+    path = f"{OUT_DIR}/{nom}.png"
+    fig.savefig(path, dpi=150, bbox_inches='tight',
+                facecolor=BG, edgecolor='none')
+    plt.close(fig)
+    print(f"  ✓ {path}")
+
+def titre_fig(fig, texte, sous=""):
+    fig.text(0.02, 0.98, texte, fontsize=13, fontweight='bold',
+             color=TEXT, va='top', fontfamily='monospace')
+    if sous:
+        fig.text(0.02, 0.955, sous, fontsize=9,
+                 color=TEXT2, va='top')
+    fig.add_artist(plt.Line2D([0.02, 0.98], [0.965, 0.965],
+                               transform=fig.transFigure,
+                               color=ORANGE, linewidth=0.8, alpha=0.6))
+
+# Noms lisibles des features
+NOMS_FEATURES = {
+    'macd_hist'           : 'MACD Histogram',
+    'fg_index'            : 'Fear & Greed Index',
+    'bb_zscore'           : 'Bollinger Z-score',
+    'vix_pct_rank'        : 'VIX Percentile (252j)',
+    'di_signal'           : 'DI+ > DI- (ADX)',
+    'zscore_20'           : 'Z-score Prix 20j',
+    'zscore_50'           : 'Z-score Prix 50j',
+    'is_q4_rally'         : 'Q4 Saisonnalité',
+    'rolling_corr_sp_vix' : 'Corrélation SP500/VIX',
+    'delta_vix'           : 'Delta VIX (1j)',
+    'ret_3d'              : 'Rendement 3 jours',
+    'breakout_20d'        : 'Cassure haussière 20j',
+    'zscore_price_60d'    : 'Z-score Prix 60j',
+    'fg_change_5d'        : 'Variation F&G 5j',
+    'prix_vs_ma50'        : 'Écart vs MA50',
+    'rsi_14'              : 'RSI 14',
+    'adx_14'              : 'ADX 14',
+    'tendance_slope_20'   : 'Pente MA20',
+    'momentum_coherent'   : 'Momentum Multi-TF',
+    'vol_ratio'           : 'Ratio Volume',
+    'ret_1d'              : 'Rendement 1 jour',
+    'ret_5d'              : 'Rendement 5 jours',
+    'rsi_7'               : 'RSI 7',
+    'fg_extreme_fear'     : 'Peur Extrême (F&G<25)',
+    'fg_extreme_greed'    : 'Avidité Extrême (F&G>75)',
+    'day_of_week'         : 'Jour de la semaine',
+    'is_january'          : 'Effet Janvier',
+    'gold_trend'          : 'Tendance Or',
+    'risk_off_signal'     : 'Signal Risk-Off (Or)',
+    'dxy_strength'        : 'Force Dollar (DXY)',
+    'dxy_ret_1d'          : 'Rendement DXY 1j',
+    'risk_on_btc'         : 'Signal Risk-On (BTC)',
+    'btc_corr_20d'        : 'Corrélation BTC/SP500 20j',
+    'drawdown_20d'        : 'Drawdown 20j (%)',
+    'drawdown_50d'        : 'Drawdown 50j (%)',
+    'chute_accel'         : 'Accélération Chute',
+    'rsi_2'               : 'RSI 2 (survente rapide)',
+    'rsi_oversold'        : 'RSI2 < 10 (panique)',
+    'williams_r'          : 'Williams %R',
+    'vix_spike'           : 'VIX Spike vs MA20',
+    'vix_extreme'         : 'VIX > 30 (crash)',
+    'vix_retour'          : 'VIX en baisse depuis pic',
+    'vix_close'           : 'VIX Niveau',
+    'vix_ret_1d'          : 'Variation VIX 1j',
+    'vix_mean_reversion'  : 'VIX Mean-Reversion',
+    'high_low_ratio'      : 'Range Haut/Bas',
+    'gap_ouverture'       : 'Gap Ouverture',
+    'gap_negatif'         : 'Gap Négatif',
+    'close_position'      : 'Position dans le Range',
+    'sp_vix_divergence'   : 'Divergence SP500/VIX',
+    'vol_20d'             : 'Volatilité 20j',
+    'atr_pct'             : 'ATR Normalisé',
+    'rebond_apres_chute'  : 'Rebond après Chute',
+    'jours_baisse_consecutifs': 'Jours Baisse Consécutifs',
+    'ombre_basse'         : 'Ombre Basse (chandelier)',
+    'corps_chandelier'    : 'Corps Chandelier',
+    'gold_ret_1d'         : 'Rendement Or 1j',
+    'gold_vs_sp500'       : 'Or vs SP500 (5j)',
+    'dxy_spike'           : 'Dollar Spike',
+    'btc_ret_1d'          : 'Rendement BTC 1j',
+    'tendance_slope_5'    : 'Pente MA5',
+}
+
+def nom_lisible(feat):
+    return NOMS_FEATURES.get(feat, feat)
+
+
+# ─────────────────────────────────────────────────────────────
+# 1. CHARGEMENT DONNÉES + MODÈLES
+# ─────────────────────────────────────────────────────────────
+
+def charger_tout():
     conn = sqlite3.connect(DB_PATH)
     df   = pd.read_sql("SELECT * FROM sp500_ml_features",
                         conn, index_col='date', parse_dates=['date'])
     conn.close()
     df.sort_index(inplace=True)
-    return df.iloc[-n_jours:].copy()
 
-# ─────────────────────────────────────────
-# 2. OBTENIR LE SIGNAL DES MODÈLES
-# ─────────────────────────────────────────
-def obtenir_signal(df):
-    try:
-        params    = joblib.load("models/regime_params.pkl")
-        vol_seuil = params.get('vol_seuil', df['vol_20d'].quantile(0.60))
-        vix_seuil = params.get('vix_seuil', 20.0)
-
-        last     = df.iloc[-1]
-        cond_vix = int(last.get('vix_close', 15) > vix_seuil)
-        cond_vol = int(last.get('vol_20d',  0.01) > vol_seuil)
-        cond_ma  = int(last.get('close',     1)   < last.get('ma_200', 1))
-        score    = cond_vix + cond_vol + cond_ma
-
-        # Déterminer régime
-        adx = last.get('adx_14', 0)
-        if score >= 2:
-            regime = "STRESSE"
-        elif adx > 20:
-            regime = "CALME_TENDANCE"
-        else:
-            regime = "CALME_LATERAL"
-
-        # Essayer de charger le modèle correspondant
-        for r in [regime, "CALME_TENDANCE", "STRESSE"]:
-            try:
-                ens    = joblib.load(f"models/ensemble_{r.lower()}.pkl")
-                scaler = joblib.load(f"models/scaler_{r.lower()}.pkl")
-                feats  = joblib.load(f"models/feats_{r.lower()}.pkl")
-                seuil  = joblib.load(f"models/seuil_{r.lower()}.pkl")
-                cols   = [f for f in feats if f in df.columns]
-                X      = np.array([[last.get(f, 0) for f in cols]])
-                X      = np.nan_to_num(X)
-                X_s    = np.nan_to_num(scaler.transform(X))
-                p_xgb  = ens['xgb'].predict_proba(X_s)[0, 1]
-                p_rf   = ens['rf'].predict_proba(X_s)[0, 1]
-                proba  = 0.60 * p_xgb + 0.40 * p_rf
-                regime = r
-                break
-            except:
-                continue
-        else:
-            proba  = 0.5
-            seuil  = 0.5
-            regime = "INCONNU"
-
-        conf   = params.get('confiance', {}).get(regime, {'achat': 0.60, 'vente': 0.40})
-        signal = "ACHAT"  if proba >= conf['achat'] else \
-                 "VENTE"  if proba <= conf['vente'] else "NEUTRE"
-        return signal, proba, regime, score
-
-    except Exception as e:
-        print(f"  ⚠️  Modèles non trouvés ({e}) → signal NEUTRE")
-        return "NEUTRE", 0.5, "INCONNU", 0
-
-# ─────────────────────────────────────────
-# 3. GRAPHIQUE PRINCIPAL
-# ─────────────────────────────────────────
-def tracer_graphique(df, signal, proba, regime, score):
-    style_dark()
-
-    fig = plt.figure(figsize=(20, 16))
-    fig.patch.set_facecolor(COULEURS['bg'])
-
-    gs = gridspec.GridSpec(
-        5, 1, figure=fig,
-        height_ratios=[4, 1.2, 1.2, 1.2, 1.2],
-        hspace=0.06
-    )
-
-    ax_prix  = fig.add_subplot(gs[0])
-    ax_vol   = fig.add_subplot(gs[1], sharex=ax_prix)
-    ax_rsi   = fig.add_subplot(gs[2], sharex=ax_prix)
-    ax_macd  = fig.add_subplot(gs[3], sharex=ax_prix)
-    ax_vix   = fig.add_subplot(gs[4], sharex=ax_prix)
-
-    dates = df.index
-    close = df['close']
-
-    col_signal = COULEURS['green'] if signal == 'ACHAT' else \
-                 COULEURS['red']   if signal == 'VENTE' else COULEURS['yellow']
-
-    # ═══════════════════════════════════════
-    # PANNEAU 1 — PRIX + MAs + BANDES BOLLINGER
-    # ═══════════════════════════════════════
-    # Chandeliers japonais
-    for i in range(len(df)):
-        o = df['open'].iloc[i]
-        h = df['high'].iloc[i]
-        l = df['low'].iloc[i]
-        c = df['close'].iloc[i]
-        color = COULEURS['green'] if c >= o else COULEURS['red']
-        ax_prix.plot([dates[i], dates[i]], [l, h], color=color,
-                     lw=0.8, alpha=0.7)
-        ax_prix.plot([dates[i], dates[i]], [min(o,c), max(o,c)],
-                     color=color, lw=3, solid_capstyle='round')
-
-    # Moyennes mobiles
-    ax_prix.plot(dates, df['ma_20'],  color=COULEURS['blue'],
-                 lw=1.4, label='MA20',  alpha=0.9)
-    ax_prix.plot(dates, df['ma_50'],  color=COULEURS['orange'],
-                 lw=1.4, label='MA50',  alpha=0.9)
-    ax_prix.plot(dates, df['ma_200'], color=COULEURS['purple'],
-                 lw=1.8, label='MA200', alpha=0.9, ls='--')
-
-    # Bandes de Bollinger
-    if 'bb_zscore' in df.columns:
-        ma20  = df['close'].rolling(20).mean()
-        std20 = df['close'].rolling(20).std()
-        bb_up = ma20 + 2 * std20
-        bb_dn = ma20 - 2 * std20
-        ax_prix.fill_between(dates, bb_dn, bb_up,
-                              alpha=0.08, color=COULEURS['blue'],
-                              label='Bollinger ±2σ')
-        ax_prix.plot(dates, bb_up, color=COULEURS['blue'],
-                     lw=0.6, alpha=0.4, ls=':')
-        ax_prix.plot(dates, bb_dn, color=COULEURS['blue'],
-                     lw=0.6, alpha=0.4, ls=':')
-
-    # Ligne verticale — dernier jour
-    ax_prix.axvline(dates[-1], color=col_signal, lw=1.5,
-                    ls='--', alpha=0.8)
-
-    # Signal box
-    prix_max = close.max()
-    prix_min = close.min()
-    emoji = "▲ ACHAT" if signal == 'ACHAT' else \
-            ("▼ VENTE" if signal == 'VENTE' else "◆ NEUTRE")
-    ax_prix.annotate(
-        f"  {emoji}\n  P={proba*100:.1f}%\n  {regime}",
-        xy=(dates[-1], close.iloc[-1]),
-        xytext=(dates[-min(15, len(dates)-1)], prix_max * 0.995),
-        fontsize=11, fontweight='bold', color=col_signal,
-        bbox=dict(boxstyle='round,pad=0.5', facecolor=COULEURS['bg'],
-                  edgecolor=col_signal, alpha=0.9),
-        arrowprops=dict(arrowstyle='->', color=col_signal, lw=1.5)
-    )
-
-    # Titre
-    date_str  = dates[-1].strftime('%d/%m/%Y')
-    prix_last = close.iloc[-1]
-    ret_5j    = (close.iloc[-1] / close.iloc[-6] - 1) * 100 if len(close) > 5 else 0
-    ret_col   = COULEURS['green'] if ret_5j > 0 else COULEURS['red']
-
-    ax_prix.set_title(
-        f"S&P 500  ·  {date_str}  ·  {prix_last:,.0f} pts  ·  "
-        f"Ret 5j : {ret_5j:+.2f}%",
-        fontsize=13, fontweight='bold', pad=12, color=COULEURS['text']
-    )
-    ax_prix.legend(loc='upper left', fontsize=9, ncol=4)
-    ax_prix.set_ylabel("Prix (pts)", fontsize=10)
-    ax_prix.grid(True, alpha=0.25)
-    ax_prix.yaxis.set_major_formatter(
-        plt.FuncFormatter(lambda x, _: f'{x:,.0f}')
-    )
-    plt.setp(ax_prix.get_xticklabels(), visible=False)
-
-    # ═══════════════════════════════════════
-    # PANNEAU 2 — VOLUME
-    # ═══════════════════════════════════════
-    colors_vol = [COULEURS['green'] if df['close'].iloc[i] >= df['open'].iloc[i]
-                  else COULEURS['red'] for i in range(len(df))]
-    ax_vol.bar(dates, df['volume'], color=colors_vol, alpha=0.6, width=0.8)
-    if 'vol_ratio' in df.columns:
-        vol_ma = df['volume'].rolling(20).mean()
-        ax_vol.plot(dates, vol_ma, color='white', lw=1.2,
-                    alpha=0.7, label='Vol MA20')
-    ax_vol.set_ylabel("Volume", fontsize=9)
-    ax_vol.legend(fontsize=8, loc='upper left')
-    ax_vol.grid(True, alpha=0.2)
-    ax_vol.yaxis.set_major_formatter(
-        plt.FuncFormatter(lambda x, _: f'{x/1e9:.1f}B')
-    )
-    plt.setp(ax_vol.get_xticklabels(), visible=False)
-
-    # ═══════════════════════════════════════
-    # PANNEAU 3 — RSI
-    # ═══════════════════════════════════════
-    if 'rsi_14' in df.columns:
-        rsi = df['rsi_14']
-        ax_rsi.plot(dates, rsi, color=COULEURS['cyan'],
-                    lw=1.5, label='RSI 14')
-        if 'rsi_7' in df.columns:
-            ax_rsi.plot(dates, df['rsi_7'], color=COULEURS['yellow'],
-                        lw=1.0, alpha=0.7, label='RSI 7')
-        ax_rsi.axhline(70, color=COULEURS['red'],   lw=1.0, ls='--',
-                        alpha=0.7, label='Surachat (70)')
-        ax_rsi.axhline(30, color=COULEURS['green'], lw=1.0, ls='--',
-                        alpha=0.7, label='Survente (30)')
-        ax_rsi.axhline(50, color='white', lw=0.6, ls=':', alpha=0.4)
-        ax_rsi.fill_between(dates, rsi, 70,
-                             where=(rsi >= 70), alpha=0.25,
-                             color=COULEURS['red'],   label='Zone surachat')
-        ax_rsi.fill_between(dates, rsi, 30,
-                             where=(rsi <= 30), alpha=0.25,
-                             color=COULEURS['green'], label='Zone survente')
-        ax_rsi.set_ylim(0, 100)
-        ax_rsi.set_ylabel("RSI", fontsize=9)
-        ax_rsi.legend(fontsize=7, loc='upper left', ncol=3)
-        ax_rsi.grid(True, alpha=0.2)
-        # Dernier RSI
-        ax_rsi.annotate(f"RSI={rsi.iloc[-1]:.1f}",
-                         xy=(dates[-1], rsi.iloc[-1]),
-                         fontsize=8, color=COULEURS['cyan'],
-                         xytext=(5, 0), textcoords='offset points')
-    plt.setp(ax_rsi.get_xticklabels(), visible=False)
-
-    # ═══════════════════════════════════════
-    # PANNEAU 4 — MACD
-    # ═══════════════════════════════════════
-    if 'macd' in df.columns:
-        macd   = df['macd']
-        signal_line = df['macd_signal']
-        hist   = df['macd_hist']
-
-        colors_macd = [COULEURS['green'] if v >= 0 else COULEURS['red']
-                       for v in hist]
-        ax_macd.bar(dates, hist, color=colors_macd, alpha=0.7, width=0.8)
-        ax_macd.plot(dates, macd,        color=COULEURS['blue'],
-                     lw=1.5, label='MACD')
-        ax_macd.plot(dates, signal_line, color=COULEURS['orange'],
-                     lw=1.5, label='Signal')
-        ax_macd.axhline(0, color='white', lw=0.8, ls='--', alpha=0.5)
-        ax_macd.set_ylabel("MACD", fontsize=9)
-        ax_macd.legend(fontsize=8, loc='upper left', ncol=3)
-        ax_macd.grid(True, alpha=0.2)
-        # Annotation croisement
-        for i in range(1, len(df)):
-            if (macd.iloc[i] > signal_line.iloc[i] and
-                    macd.iloc[i-1] <= signal_line.iloc[i-1]):
-                ax_macd.annotate('▲', xy=(dates[i], macd.iloc[i]),
-                                  color=COULEURS['green'], fontsize=10)
-            elif (macd.iloc[i] < signal_line.iloc[i] and
-                      macd.iloc[i-1] >= signal_line.iloc[i-1]):
-                ax_macd.annotate('▼', xy=(dates[i], macd.iloc[i]),
-                                  color=COULEURS['red'], fontsize=10)
-    plt.setp(ax_macd.get_xticklabels(), visible=False)
-
-    # ═══════════════════════════════════════
-    # PANNEAU 5 — VIX
-    # ═══════════════════════════════════════
+    # Enrichissement (même que 2_train_models_FINAL)
     if 'vix_close' in df.columns:
-        vix = df['vix_close']
-        ax_vix.fill_between(dates, vix, alpha=0.35,
-                             color=COULEURS['red'], label='VIX')
-        ax_vix.plot(dates, vix, color=COULEURS['red'], lw=1.5)
+        df['delta_vix']           = df['vix_close'].diff(1)
+        df['vix_pct_rank']        = df['vix_close'].rolling(252, min_periods=60).rank(pct=True)
+        df['rolling_corr_sp_vix'] = df['ret_1d'].rolling(20).corr(df['vix_ret_1d'])
+        df['vix_mean_reversion']  = (df['vix_close'] /
+                                     df['vix_close'].rolling(252, min_periods=60).mean() - 1)
 
-        # Zones VIX
-        ax_vix.axhline(20, color=COULEURS['yellow'], lw=1.2, ls='--',
-                        alpha=0.8, label='Seuil stress (20)')
-        ax_vix.axhline(30, color=COULEURS['red'],    lw=1.2, ls='--',
-                        alpha=0.8, label='Panique (30)')
-        ax_vix.fill_between(dates, 20, vix.clip(upper=30),
-                             where=(vix >= 20), alpha=0.12,
-                             color=COULEURS['yellow'])
-        ax_vix.fill_between(dates, 30, vix.clip(lower=30),
-                             where=(vix >= 30), alpha=0.25,
-                             color=COULEURS['red'])
+    df['zscore_price_60d'] = (
+        (df['close'] - df['close'].rolling(60).mean()) /
+        df['close'].rolling(60).std()
+    )
+    if 'drawdown_20d' not in df.columns:
+        df['drawdown_20d'] = (df['close'] / df['close'].rolling(20).max() - 1) * 100
+    if 'drawdown_50d' not in df.columns:
+        df['drawdown_50d'] = (df['close'] / df['close'].rolling(50).max() - 1) * 100
 
-        ax_vix.set_ylabel("VIX", fontsize=9)
-        ax_vix.legend(fontsize=8, loc='upper left', ncol=3)
-        ax_vix.grid(True, alpha=0.2)
+    df['regime_bin'] = np.where(df['vix_close'] < 20, 'calme', 'stress') \
+                       if 'vix_close' in df.columns else 'calme'
 
-        # Dernier VIX
-        vix_last = vix.iloc[-1]
-        vix_col  = COULEURS['red'] if vix_last > 20 else COULEURS['green']
-        ax_vix.annotate(f"VIX={vix_last:.1f}",
-                         xy=(dates[-1], vix_last),
-                         fontsize=9, color=vix_col, fontweight='bold',
-                         xytext=(-40, 8), textcoords='offset points')
+    df['return_5j'] = df['close'].pct_change(5).shift(-5)
+    df['target']    = np.nan
+    df.loc[df['return_5j'] >  0.015, 'target'] = 1
+    df.loc[df['return_5j'] < -0.008, 'target'] = 0
 
-    # ─────────────────────────────────────
-    # BANDE DE SIGNAL EN HAUT
-    # ─────────────────────────────────────
-    fig.text(0.5, 0.97,
-             f"SIGNAL : {signal}  |  P(hausse 5j) = {proba*100:.1f}%  "
-             f"|  Régime = {regime}  |  Score stress = {score}/3",
-             ha='center', va='top', fontsize=13, fontweight='bold',
-             color=col_signal,
-             bbox=dict(boxstyle='round,pad=0.4', facecolor=COULEURS['bg2'],
-                       edgecolor=col_signal, alpha=0.95))
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    df.ffill(inplace=True)
+    df.dropna(subset=['target'], inplace=True)
+    df.dropna(inplace=True)
 
-    # ─────────────────────────────────────
-    # TABLEAU RÉSUMÉ DES INDICATEURS
-    # ─────────────────────────────────────
-    last = df.iloc[-1]
-    rsi_val  = last.get('rsi_14', 0)
-    macd_val = last.get('macd_hist', 0)
-    bb_val   = last.get('bb_zscore', 0)
-    adx_val  = last.get('adx_14', 0)
-    vix_val  = last.get('vix_close', 0)
+    # Charger les modèles
+    modeles, scalers, features = {}, {}, {}
+    for regime in ['calme', 'stress']:
+        try:
+            modeles[regime]  = joblib.load(f"models/ensemble_{regime}.pkl")
+            scalers[regime]  = joblib.load(f"models/scaler_{regime}.pkl")
+            features[regime] = joblib.load(f"models/features_{regime}.pkl")
+            print(f"  ✓ Modèle {regime} chargé")
+        except FileNotFoundError:
+            print(f"  ⚠ Modèle {regime} absent — lance 2_train_models_FINAL.py")
 
-    def feu(val, seuil_pos, seuil_neg, inverse=False):
-        if not inverse:
-            if val > seuil_pos: return '🟢'
-            if val < seuil_neg: return '🔴'
+    return df, modeles, scalers, features
+
+
+# ─────────────────────────────────────────────────────────────
+# 2. CALCUL DES VALEURS SHAP (XGBoost — le plus interprétable)
+# ─────────────────────────────────────────────────────────────
+
+def calculer_shap(df, modeles, scalers, features, regime, n_sample=500):
+    """
+    Calcule les valeurs SHAP sur un échantillon du test set.
+    Utilise le modèle XGBoost (modèle 'xgb' de l'ensemble).
+    """
+    print(f"\n  Calcul SHAP — régime {regime.upper()}...")
+
+    mask  = df['regime_bin'] == regime
+    df_r  = df[mask].copy()
+
+    if len(df_r) < 50:
+        print(f"  ⚠ Pas assez de données ({len(df_r)}) pour {regime}")
+        return None, None, None
+
+    # Features disponibles
+    feats = [f for f in features[regime] if f in df_r.columns]
+
+    # Split temporel — prendre le test set (20% final)
+    split = int(len(df_r) * 0.80)
+    X_test = df_r[feats].iloc[split:]
+    y_test = df_r['target'].iloc[split:]
+
+    # Sous-échantillon pour la vitesse
+    if len(X_test) > n_sample:
+        idx    = np.random.choice(len(X_test), n_sample, replace=False)
+        idx    = sorted(idx)
+        X_samp = X_test.iloc[idx]
+        y_samp = y_test.iloc[idx]
+    else:
+        X_samp = X_test
+        y_samp = y_test
+
+    # Scaler
+    scaler   = scalers[regime]
+    X_scaled = scaler.transform(X_samp)
+    X_df     = pd.DataFrame(X_scaled, columns=feats, index=X_samp.index)
+    X_np     = X_scaled.astype(np.float64)   # XGBoost>=2.0 + SHAP exigent numpy pur
+
+    # Extraire le XGBoost depuis l'ensemble calibré
+    xgb_model = None
+    for nom, m in modeles[regime].items():
+        if nom == 'xgb':
+            # CalibratedClassifierCV → accéder au modèle sous-jacent
+            try:
+                # sklearn >= 1.0
+                base = m['model'].calibrated_classifiers_[0].estimator
+            except AttributeError:
+                try:
+                    base = m['model'].calibrated_classifiers_[0].base_estimator
+                except AttributeError:
+                    base = m['model']
+            xgb_model = base
+            break
+
+    if xgb_model is None:
+        print(f"  ⚠ XGBoost non trouvé dans l'ensemble {regime}")
+        return None, None, None
+
+    # Explainer SHAP — numpy obligatoire pour XGBoost >= 2.0
+    explainer  = shap.TreeExplainer(xgb_model)
+    shap_vals  = explainer.shap_values(X_np)   # ← X_np pas X_df
+
+    # Si multi-output → prendre classe 1 (hausse)
+    if isinstance(shap_vals, list):
+        shap_vals = shap_vals[1]
+
+    print(f"    SHAP calculé sur {len(X_df)} observations, {len(feats)} features")
+
+    return shap_vals, X_df, feats
+
+
+# ─────────────────────────────────────────────────────────────
+# 3. GRAPHE 1 — BEESWARM SUMMARY PLOT
+# ─────────────────────────────────────────────────────────────
+
+def graphe_beeswarm(shap_vals, X_df, feats, regime, top_n=20):
+    """
+    Beeswarm plot — montre la distribution des valeurs SHAP
+    pour chaque feature. Couleur = valeur de la feature.
+    """
+    n_feat    = min(top_n, len(feats))
+    mean_abs  = np.abs(shap_vals).mean(axis=0)
+    top_idx   = np.argsort(mean_abs)[::-1][:n_feat]
+    top_feats = [feats[i] for i in top_idx]
+    top_shap  = shap_vals[:, top_idx]
+    top_X     = X_df.iloc[:, top_idx]
+
+    fig, ax = plt.subplots(figsize=(14, 10))
+    fig.patch.set_facecolor(BG)
+    ax.set_facecolor(BG2)
+
+    titre_fig(fig,
+              f"SHAP — IMPORTANCE DES FEATURES ({regime.upper()})",
+              f"Beeswarm plot — chaque point = 1 observation | "
+              f"couleur = valeur de la feature | axe X = impact sur P(hausse)")
+
+    # Colormap : bleu (valeur basse) → rouge (valeur haute)
+    cmap = LinearSegmentedColormap.from_list('br', [BLUE, CYAN, ORANGE, RED])
+
+    # Tracer chaque feature
+    for i, (feat_idx, feat_name) in enumerate(zip(range(n_feat), top_feats)):
+        shap_col  = top_shap[:, feat_idx]
+        feat_col  = top_X.iloc[:, feat_idx]
+
+        # Normaliser la couleur
+        feat_norm = (feat_col - feat_col.min()) / (feat_col.max() - feat_col.min() + 1e-9)
+
+        # Jitter vertical pour le beeswarm
+        y_jitter = np.random.uniform(-0.3, 0.3, len(shap_col))
+        y_pos    = (n_feat - 1 - i) + y_jitter
+
+        colors = cmap(feat_norm.values)
+        ax.scatter(shap_col, y_pos, c=colors, s=8, alpha=0.6,
+                   linewidths=0, zorder=3)
+
+        # Ligne de référence
+        ax.axhline(n_feat - 1 - i, color=GRID, linewidth=0.4,
+                   alpha=0.5, zorder=1)
+
+        # Importance moyenne (barre grise)
+        imp = mean_abs[top_idx[feat_idx]]
+        ax.barh(n_feat - 1 - i, imp * 0.3, left=-imp * 0.3 - 0.5,
+                height=0.3, color=TEXT2, alpha=0.15, zorder=2)
+
+    ax.set_yticks(range(n_feat))
+    ax.set_yticklabels([nom_lisible(f) for f in reversed(top_feats)],
+                        fontsize=8.5)
+    ax.set_xlabel("Valeur SHAP  (→ augmente P(hausse)  ←  diminue P(hausse))",
+                  color=TEXT2)
+    ax.axvline(0, color=GRID, linewidth=1, alpha=0.8)
+    ax.set_xlim(top_shap.min() * 1.1, top_shap.max() * 1.1)
+
+    # Colorbar
+    sm = plt.cm.ScalarMappable(cmap=cmap,
+                                norm=plt.Normalize(vmin=0, vmax=1))
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=ax, shrink=0.4, pad=0.01)
+    cbar.set_label("Valeur normalisée de la feature\n(bas → haut)",
+                   color=TEXT2, fontsize=8)
+    cbar.ax.yaxis.set_tick_params(color=TEXT2)
+
+    # Annotation
+    color_regime = GREEN if regime == 'calme' else ORANGE
+    ax.text(0.98, 0.02,
+            f"Régime : {regime.upper()}\n"
+            f"N obs  : {len(X_df)}\n"
+            f"N feat : {len(feats)}",
+            transform=ax.transAxes, fontsize=8,
+            va='bottom', ha='right', color=color_regime,
+            fontfamily='monospace',
+            bbox=dict(boxstyle='round,pad=0.5', facecolor=BG3,
+                      edgecolor=color_regime, alpha=0.8))
+
+    fig.tight_layout(rect=[0, 0, 1, 0.93])
+    sauvegarder(fig, f"01_shap_beeswarm_{regime}")
+
+
+# ─────────────────────────────────────────────────────────────
+# 4. GRAPHE 2 — BAR PLOT COMPARAISON CALME vs STRESS
+# ─────────────────────────────────────────────────────────────
+
+def graphe_bar_comparaison(resultats_shap, top_n=25):
+    """
+    Barres horizontales comparant l'importance SHAP
+    entre le régime calme et le régime stress.
+    """
+    # Récupérer toutes les features de chaque régime
+    imp_calme  = {}
+    imp_stress = {}
+
+    for regime, (shap_vals, X_df, feats) in resultats_shap.items():
+        if shap_vals is None:
+            continue
+        mean_abs = np.abs(shap_vals).mean(axis=0)
+        for feat, imp in zip(feats, mean_abs):
+            if regime == 'calme':
+                imp_calme[feat] = imp
+            else:
+                imp_stress[feat] = imp
+
+    # Union de toutes les features
+    all_feats = list(set(list(imp_calme.keys()) + list(imp_stress.keys())))
+    df_imp    = pd.DataFrame({
+        'calme' : [imp_calme.get(f, 0)  for f in all_feats],
+        'stress': [imp_stress.get(f, 0) for f in all_feats],
+    }, index=all_feats)
+
+    df_imp['total'] = df_imp['calme'] + df_imp['stress']
+    df_imp          = df_imp.nlargest(top_n, 'total')
+    df_imp          = df_imp.sort_values('total', ascending=True)
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 12))
+    fig.patch.set_facecolor(BG)
+    titre_fig(fig,
+              "SHAP — IMPORTANCE COMPARÉE PAR RÉGIME",
+              "Importance moyenne |SHAP| — calme vs stress — "
+              "révèle quelles features comptent selon le contexte")
+
+    noms = [nom_lisible(f) for f in df_imp.index]
+
+    # ── Graphe gauche : côte à côte ───────────────────────────────
+    y_pos = np.arange(len(df_imp))
+    h     = 0.38
+
+    ax1.barh(y_pos + h/2, df_imp['calme'].values,
+             height=h, color=GREEN, alpha=0.8,
+             label='Régime CALME', edgecolor='none')
+    ax1.barh(y_pos - h/2, df_imp['stress'].values,
+             height=h, color=ORANGE, alpha=0.8,
+             label='Régime STRESS', edgecolor='none')
+
+    ax1.set_yticks(y_pos)
+    ax1.set_yticklabels(noms, fontsize=8)
+    ax1.set_xlabel("|SHAP| moyen")
+    ax1.set_title("Importance par régime")
+    ax1.legend(fontsize=9, loc='lower right')
+    ax1.axvline(0, color=GRID, linewidth=0.6)
+
+    # ── Graphe droit : différentiel stress - calme ────────────────
+    diff = df_imp['stress'] - df_imp['calme']
+    colors_diff = [ORANGE if d > 0 else GREEN for d in diff.values]
+
+    ax2.barh(y_pos, diff.values, color=colors_diff, alpha=0.8,
+             edgecolor='none')
+    ax2.axvline(0, color=TEXT2, linewidth=1.2)
+
+    ax2.set_yticks(y_pos)
+    ax2.set_yticklabels(noms, fontsize=8)
+    ax2.set_xlabel("Différentiel SHAP  (stress − calme)")
+    ax2.set_title("Features exclusives à chaque régime\n"
+                  "Orange = plus important en stress  |  "
+                  "Vert = plus important en calme")
+
+    # Annotations
+    for i, (d, f) in enumerate(zip(diff.values, df_imp.index)):
+        if abs(d) > diff.abs().quantile(0.75):
+            label = "↑ STRESS" if d > 0 else "↑ CALME"
+            col   = ORANGE if d > 0 else GREEN
+            ax2.text(d + (0.001 if d > 0 else -0.001), i,
+                     label, va='center',
+                     ha='left' if d > 0 else 'right',
+                     fontsize=7, color=col)
+
+    for ax in [ax1, ax2]:
+        ax.set_facecolor(BG2)
+        ax.tick_params(colors=TEXT2)
+
+    fig.tight_layout(rect=[0, 0, 1, 0.93])
+    sauvegarder(fig, "02_shap_bar_comparaison")
+
+
+# ─────────────────────────────────────────────────────────────
+# 5. GRAPHE 3 — DEPENDENCE PLOTS (effets partiels top 6)
+# ─────────────────────────────────────────────────────────────
+
+def graphe_dependence(shap_vals, X_df, feats, regime, top_n=6):
+    """
+    Pour chaque top feature : scatter SHAP vs valeur de la feature.
+    Montre comment la feature influence la prédiction.
+    """
+    mean_abs = np.abs(shap_vals).mean(axis=0)
+    top_idx  = np.argsort(mean_abs)[::-1][:top_n]
+
+    fig, axes = plt.subplots(2, 3, figsize=(18, 11))
+    fig.patch.set_facecolor(BG)
+    titre_fig(fig,
+              f"SHAP — EFFETS PARTIELS TOP {top_n} FEATURES ({regime.upper()})",
+              "Comment chaque feature influence P(hausse) — "
+              "couleur = valeur de la feature d'interaction principale")
+    axes = axes.flatten()
+
+    # Feature d'interaction (VIX si dispo, sinon 2e feature)
+    vix_col = 'vix_close' if 'vix_close' in feats else feats[1] if len(feats) > 1 else None
+
+    for plot_i, feat_idx in enumerate(top_idx):
+        ax        = axes[plot_i]
+        feat_name = feats[feat_idx]
+        shap_col  = shap_vals[:, feat_idx]
+        feat_col  = X_df.iloc[:, feat_idx]
+
+        # Couleur interaction
+        if vix_col and vix_col in feats and feat_name != vix_col:
+            vix_idx   = feats.index(vix_col)
+            int_col   = X_df.iloc[:, vix_idx]
+            int_label = nom_lisible(vix_col)
         else:
-            if val < seuil_pos: return '🟢'
-            if val > seuil_neg: return '🔴'
-        return '🟡'
+            int_col   = feat_col
+            int_label = nom_lisible(feat_name)
 
-    resume = [
-        f"RSI14 = {rsi_val:.1f}  {feu(rsi_val, 55, 45)}",
-        f"MACD hist = {macd_val:.2f}  {feu(macd_val, 0, 0)}",
-        f"BB zscore = {bb_val:.2f}  {feu(bb_val, 0, -1, inverse=True)}",
-        f"ADX = {adx_val:.1f}  {'🟢 tendance' if adx_val>25 else '🟡 neutre'}",
-        f"VIX = {vix_val:.1f}  {feu(vix_val, 0, 20, inverse=True)}",
-        f"MA200 = {'✅ AU-DESSUS' if last.get('close',0) > last.get('ma_200',0) else '⚠️ SOUS'}",
-    ]
+        int_norm = (int_col - int_col.min()) / (int_col.max() - int_col.min() + 1e-9)
 
-    fig.text(0.01, 0.03,
-             "  INDICATEURS :  " + "   |   ".join(resume),
-             ha='left', va='bottom', fontsize=9,
-             color=COULEURS['muted'],
-             bbox=dict(boxstyle='round', facecolor=COULEURS['bg2'],
-                       edgecolor=COULEURS['border'], alpha=0.9))
+        cmap   = LinearSegmentedColormap.from_list('br', [BLUE, CYAN, RED])
+        colors = cmap(int_norm.values)
 
-    plt.tight_layout(rect=[0, 0.03, 1, 0.96])
+        sc = ax.scatter(feat_col, shap_col, c=colors, s=12,
+                        alpha=0.5, linewidths=0)
 
-    chemin = "outputs/chart_signal.png"
-    plt.savefig(chemin, dpi=150, bbox_inches='tight',
-                facecolor=COULEURS['bg'])
-    plt.close()
-    print(f"  → {chemin}")
-    return chemin
+        # Ligne de tendance LOWESS
+        try:
+            from scipy.stats import binned_statistic
+            bins   = min(30, len(feat_col) // 10)
+            bin_means, bin_edges, _ = binned_statistic(
+                feat_col, shap_col, statistic='mean', bins=bins)
+            bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+            valid = ~np.isnan(bin_means)
+            ax.plot(bin_centers[valid], bin_means[valid],
+                    color=YELLOW, linewidth=2, alpha=0.9,
+                    label='Tendance moyenne', zorder=5)
+        except Exception:
+            pass
 
-# ─────────────────────────────────────────
-# EXÉCUTION
-# ─────────────────────────────────────────
+        ax.axhline(0, color=GRID, linewidth=0.8, alpha=0.7)
+        ax.axvline(feat_col.mean(), color=TEXT2, linewidth=0.8,
+                   linestyle=':', alpha=0.5, label='Moyenne')
+
+        ax.set_xlabel(nom_lisible(feat_name), fontsize=8.5)
+        ax.set_ylabel("Valeur SHAP", fontsize=8)
+        ax.set_title(f"#{plot_i+1}  {nom_lisible(feat_name)}")
+
+        # Colorbar par subplot
+        sm    = plt.cm.ScalarMappable(cmap=cmap,
+                                       norm=plt.Normalize(0, 1))
+        sm.set_array([])
+        cbar  = fig.colorbar(sm, ax=ax, shrink=0.6, pad=0.01)
+        cbar.set_label(f"↑ {int_label}", fontsize=7, color=TEXT2)
+
+        ax.legend(fontsize=7, loc='upper right')
+
+    fig.tight_layout(rect=[0, 0, 1, 0.93])
+    sauvegarder(fig, f"03_shap_dependence_{regime}")
+
+
+# ─────────────────────────────────────────────────────────────
+# 6. GRAPHE 4 — WATERFALL : EXPLICATION DU SIGNAL AUJOURD'HUI
+# ─────────────────────────────────────────────────────────────
+
+def graphe_waterfall_today(df, modeles, scalers, features):
+    """
+    Explique le signal du dernier jour disponible :
+    montre comment chaque feature contribue à P(hausse).
+    """
+    vix_actuel = df['vix_close'].iloc[-1] if 'vix_close' in df.columns else 20
+    regime     = 'calme' if vix_actuel < 20 else 'stress'
+
+    if regime not in modeles:
+        print(f"  ⚠ Modèle {regime} non disponible")
+        return
+
+    feats       = [f for f in features[regime] if f in df.columns]
+    derniere    = df[feats].iloc[[-1]]
+    X_scaled    = scalers[regime].transform(derniere)
+    X_df        = pd.DataFrame(X_scaled, columns=feats)
+    X_np        = X_scaled.astype(np.float64)   # numpy pur pour SHAP
+
+    # XGBoost
+    xgb_model = None
+    for nom, m in modeles[regime].items():
+        if nom == 'xgb':
+            try:
+                xgb_model = m['model'].calibrated_classifiers_[0].estimator
+            except AttributeError:
+                try:
+                    xgb_model = m['model'].calibrated_classifiers_[0].base_estimator
+                except AttributeError:
+                    xgb_model = m['model']
+            break
+
+    if xgb_model is None:
+        return
+
+    explainer  = shap.TreeExplainer(xgb_model)
+    shap_vals  = explainer.shap_values(X_np)   # ← numpy pur
+    if isinstance(shap_vals, list):
+        shap_vals = shap_vals[1]
+
+    shap_today = shap_vals[0]
+    base_val   = explainer.expected_value
+    if isinstance(base_val, (list, np.ndarray)):
+        base_val = base_val[1] if len(base_val) > 1 else base_val[0]
+
+    # Top 15 contributions
+    top_n   = 15
+    idx_s   = np.argsort(np.abs(shap_today))[::-1][:top_n]
+    s_top   = shap_today[idx_s]
+    f_top   = [feats[i] for i in idx_s]
+    v_top   = X_df.values[0][idx_s]
+
+    # Valeurs originales (avant scaling)
+    v_orig  = derniere.values[0][[list(feats).index(f) for f in f_top]]
+
+    # Construire le waterfall
+    cumul   = base_val
+    steps   = [(base_val, 'Base', 0, None)]
+    for feat, sh, v_o in zip(f_top, s_top, v_orig):
+        steps.append((cumul, feat, sh, v_o))
+        cumul += sh
+    steps.append((cumul, 'PRÉDICTION', 0, None))
+
+    final_proba = 1 / (1 + np.exp(-cumul))   # sigmoïde approximative
+
+    fig, ax = plt.subplots(figsize=(14, 10))
+    fig.patch.set_facecolor(BG)
+    ax.set_facecolor(BG2)
+
+    date_str = str(df.index[-1].date())
+    titre_fig(fig,
+              f"SHAP WATERFALL — EXPLICATION SIGNAL DU {date_str}",
+              f"Régime : {regime.upper()}  |  VIX : {vix_actuel:.1f}  |  "
+              f"P(hausse) finale : {final_proba*100:.1f}%")
+
+    # Barres waterfall
+    n     = len(steps)
+    y_pos = range(n)
+    lefts = []
+    vals  = []
+    cols  = []
+
+    for i, (start, feat, sh, v_o) in enumerate(steps):
+        if i == 0:  # Base
+            lefts.append(0)
+            vals.append(start)
+            cols.append(BLUE)
+        elif i == n - 1:  # Final
+            lefts.append(0)
+            vals.append(start)
+            cols.append(GREEN if start > base_val else RED)
+        else:
+            lefts.append(min(start, start + sh))
+            vals.append(abs(sh))
+            cols.append(GREEN if sh > 0 else RED)
+
+    ax.barh(y_pos, vals, left=lefts, color=cols,
+            alpha=0.85, edgecolor=BG, linewidth=0.5, height=0.65)
+
+    # Labels
+    noms_labels = ['VALEUR DE BASE']
+    for feat, sh, v_o in zip(f_top, s_top, v_orig):
+        noms_labels.append(f"{nom_lisible(feat)}  [{v_o:.3f}]")
+    noms_labels.append('PRÉDICTION FINALE')
+
+    ax.set_yticks(list(y_pos))
+    ax.set_yticklabels(noms_labels, fontsize=8.5)
+
+    # Valeurs SHAP sur les barres
+    for i, (start, feat, sh, _) in enumerate(steps):
+        if i == 0:
+            ax.text(start/2, i, f"{start:.3f}",
+                    ha='center', va='center', fontsize=7.5,
+                    color='white', fontweight='bold')
+        elif i < n - 1:
+            x_txt = start + sh/2
+            ax.text(x_txt, i,
+                    f"{sh:+.3f}", ha='center', va='center',
+                    fontsize=7.5, color='white', fontweight='bold')
+        else:
+            ax.text(start/2, i, f"{start:.3f}  →  {final_proba*100:.1f}%",
+                    ha='center', va='center', fontsize=8,
+                    color='white', fontweight='bold')
+
+    # Ligne de base
+    ax.axvline(base_val, color=BLUE, linewidth=1,
+               linestyle='--', alpha=0.5, label=f'Base = {base_val:.3f}')
+    ax.axvline(0, color=GRID, linewidth=0.8, alpha=0.6)
+
+    ax.set_xlabel("Score log-odds (→ hausse probable  |  ← baisse probable)")
+    ax.legend(fontsize=8)
+
+    # Box de résumé
+    signal = "FORT ACHAT ▲▲" if final_proba > 0.65 else \
+             "ACHAT ▲"       if final_proba > 0.55 else \
+             "NEUTRE →"      if final_proba > 0.45 else \
+             "VENTE ▼"
+    color_signal = GREEN if final_proba > 0.55 else \
+                   RED   if final_proba < 0.45 else TEXT2
+
+    ax.text(0.98, 0.02,
+            f"Signal : {signal}\nP(hausse) : {final_proba*100:.1f}%",
+            transform=ax.transAxes, fontsize=10,
+            va='bottom', ha='right', color=color_signal,
+            fontweight='bold', fontfamily='monospace',
+            bbox=dict(boxstyle='round,pad=0.6', facecolor=BG3,
+                      edgecolor=color_signal, alpha=0.9))
+
+    fig.tight_layout(rect=[0, 0, 1, 0.93])
+    sauvegarder(fig, "04_shap_waterfall_today")
+
+
+# ─────────────────────────────────────────────────────────────
+# 7. GRAPHE 5 — HEATMAP SHAP DANS LE TEMPS
+# ─────────────────────────────────────────────────────────────
+
+def graphe_shap_time(shap_vals, X_df, feats, regime, top_n=12):
+    """
+    Heatmap de l'évolution des valeurs SHAP dans le temps.
+    Permet de voir quand chaque feature a été determinante.
+    """
+    mean_abs = np.abs(shap_vals).mean(axis=0)
+    top_idx  = np.argsort(mean_abs)[::-1][:top_n]
+    top_feats = [feats[i] for i in top_idx]
+    top_shap  = shap_vals[:, top_idx]
+
+    # Normaliser chaque feature entre -1 et +1 pour la visualisation
+    top_shap_norm = top_shap / (np.abs(top_shap).max(axis=0) + 1e-9)
+
+    # Rééchantillonner sur 100 points si trop de données
+    if len(X_df) > 200:
+        step = len(X_df) // 100
+        top_shap_norm = top_shap_norm[::step]
+        dates = X_df.index[::step]
+    else:
+        dates = X_df.index
+
+    fig, ax = plt.subplots(figsize=(18, 8))
+    fig.patch.set_facecolor(BG)
+    ax.set_facecolor(BG2)
+
+    titre_fig(fig,
+              f"SHAP DANS LE TEMPS — RÉGIME {regime.upper()}",
+              "Contribution de chaque feature dans le temps — "
+              "rouge = pousse vers hausse | bleu = pousse vers baisse")
+
+    cmap = LinearSegmentedColormap.from_list('rb', [BLUE, BG2, RED])
+
+    im = ax.imshow(top_shap_norm.T, cmap=cmap, vmin=-1, vmax=1,
+                   aspect='auto', interpolation='nearest')
+
+    ax.set_yticks(range(top_n))
+    ax.set_yticklabels([nom_lisible(f) for f in top_feats], fontsize=9)
+
+    # Axe x : dates
+    n_ticks = min(10, len(dates))
+    tick_idx = np.linspace(0, len(dates)-1, n_ticks, dtype=int)
+    ax.set_xticks(tick_idx)
+    ax.set_xticklabels([str(dates[i].date()) if hasattr(dates[i], 'date')
+                        else str(dates[i])
+                        for i in tick_idx],
+                       rotation=30, ha='right', fontsize=7.5)
+
+    plt.colorbar(im, ax=ax, shrink=0.6, pad=0.01,
+                 label='SHAP normalisé (rouge=↑hausse, bleu=↑baisse)')
+
+    ax.set_xlabel("Temps →")
+    ax.set_title(f"Évolution des contributions SHAP — {regime.upper()}")
+
+    fig.tight_layout(rect=[0, 0, 1, 0.93])
+    sauvegarder(fig, f"05_shap_heatmap_time_{regime}")
+
+
+# ─────────────────────────────────────────────────────────────
+# EXÉCUTION PRINCIPALE
+# ─────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
+    setup_theme()
+    np.random.seed(42)
+
     print("=" * 55)
-    print("  GRAPHIQUE DE CONFIRMATION DU SIGNAL")
+    print("  ANALYSE SHAP — S&P500 ML PREDICTOR")
     print("=" * 55)
 
-    print("Chargement des données...")
-    df = charger_donnees(N_JOURS)
-    print(f"  {len(df)} jours chargés ({df.index[0].strftime('%d/%m/%Y')}"
-          f" → {df.index[-1].strftime('%d/%m/%Y')})")
+    # Chargement
+    print("\n[1/4] Chargement données et modèles...")
+    df, modeles, scalers, features = charger_tout()
 
-    print("Calcul du signal...")
-    signal, proba, regime, score = obtenir_signal(df)
-    print(f"  Signal  : {signal}")
-    print(f"  Proba   : {proba*100:.1f}%")
-    print(f"  Régime  : {regime}")
+    if not modeles:
+        print("\n  ⚠ Aucun modèle trouvé.")
+        print("  Lance d'abord : python 2_train_models_FINAL.py")
+        exit(1)
 
-    print("Génération du graphique...")
-    chemin = tracer_graphique(df, signal, proba, regime, score)
+    # Calcul SHAP par régime
+    print("\n[2/4] Calcul des valeurs SHAP...")
+    resultats_shap = {}
+    for regime in ['calme', 'stress']:
+        if regime not in modeles:
+            continue
+        sv, xdf, feats = calculer_shap(df, modeles, scalers,
+                                        features, regime, n_sample=400)
+        resultats_shap[regime] = (sv, xdf, feats)
 
-    print(f"\nOuvre le graphique :")
-    print(f"  start {chemin}")
-    os.system(f'start "" "{os.path.abspath(chemin)}"')
+    # Génération des graphes
+    print("\n[3/4] Génération des graphes...")
+
+    for regime, (sv, xdf, feats) in resultats_shap.items():
+        if sv is None:
+            continue
+        print(f"\n  Régime {regime.upper()} :")
+        graphe_beeswarm(sv, xdf, feats, regime, top_n=20)
+        graphe_dependence(sv, xdf, feats, regime, top_n=6)
+        graphe_shap_time(sv, xdf, feats, regime, top_n=12)
+
+    # Comparaison inter-régime
+    print("\n  Comparaison calme vs stress :")
+    graphe_bar_comparaison(resultats_shap, top_n=25)
+
+    # Waterfall du signal aujourd'hui
+    print("\n  Waterfall signal aujourd'hui :")
+    graphe_waterfall_today(df, modeles, scalers, features)
+
+    # Résumé textuel
+    print("\n[4/4] Résumé des features les plus importantes\n")
+    for regime, (sv, xdf, feats) in resultats_shap.items():
+        if sv is None:
+            continue
+        mean_abs = np.abs(sv).mean(axis=0)
+        top10    = np.argsort(mean_abs)[::-1][:10]
+        print(f"  TOP 10 — Régime {regime.upper()}")
+        print(f"  {'─'*45}")
+        for rank, i in enumerate(top10, 1):
+            print(f"  {rank:>2}. {nom_lisible(feats[i]):<35} "
+                  f"{mean_abs[i]:.4f}")
+        print()
+
+    print("=" * 55)
+    print(f"  Graphes sauvegardés → {OUT_DIR}/")
+    print("  01_shap_beeswarm_calme.png")
+    print("  01_shap_beeswarm_stress.png")
+    print("  02_shap_bar_comparaison.png")
+    print("  03_shap_dependence_calme.png")
+    print("  03_shap_dependence_stress.png")
+    print("  04_shap_waterfall_today.png")
+    print("  05_shap_heatmap_time_calme.png")
+    print("  05_shap_heatmap_time_stress.png")
+    print("=" * 55)

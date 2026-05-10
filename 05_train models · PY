@@ -1,352 +1,612 @@
 # ============================================================
-#  2_train_extreme.py — MODÈLE MOUVEMENTS EXTRÊMES
-#  Prédit séparément :
-#    - FORTE HAUSSE (> +1.5% sur 5j)
-#    - FORTE BAISSE (< -1.5% sur 5j)
-#  Ne trade que quand le modèle est très confiant
+#  4_prediction_tendance.py
+#  Prédiction de tendance marché : HAUSSIÈRE / BAISSIÈRE
+#
+#  3 horizons :
+#    Court terme  : 5 jours
+#    Moyen terme  : 20 jours
+#    Long terme   : 60 jours
+#
+#  Méthode : combinaison ML (modèles existants) +
+#            analyse technique multi-timeframe +
+#            score de conviction global
 # ============================================================
 
-import pandas as pd
-import numpy as np
-import sqlite3
-import joblib
-import os
 import warnings
 warnings.filterwarnings('ignore')
 
-from sklearn.preprocessing      import StandardScaler
-from sklearn.calibration        import CalibratedClassifierCV
-from sklearn.ensemble           import RandomForestClassifier
-from sklearn.metrics            import (accuracy_score, classification_report,
-                                         roc_auc_score, f1_score,
-                                         confusion_matrix, precision_score,
-                                         recall_score)
-from sklearn.utils.class_weight import compute_class_weight
-from sklearn.model_selection    import TimeSeriesSplit
-import xgboost as xgb
+import numpy as np
+import pandas as pd
+import sqlite3
+import joblib
+import os
+from datetime import datetime, timedelta
 
-try:
-    import optuna
-    optuna.logging.set_verbosity(optuna.logging.WARNING)
-    OPTUNA_OK = True
-    print("✓ Optuna disponible")
-except ImportError:
-    OPTUNA_OK = False
+DB_PATH = "data/market_data.db"
+os.makedirs("results", exist_ok=True)
 
-os.makedirs("models", exist_ok=True)
-DB_PATH  = "data/market_data.db"
-N_TRIALS = 60
 
-# Seuils de confiance — on ne trade que si très sûr
-SEUIL_ACHAT = 0.55   # P(forte hausse) > 55%
-SEUIL_VENTE = 0.55   # P(forte baisse) > 55%
+# ─────────────────────────────────────────────────────────────
+# 1. CHARGEMENT DES DONNÉES
+# ─────────────────────────────────────────────────────────────
 
-# ─────────────────────────────────────────
-# 1. CHARGEMENT
-# ─────────────────────────────────────────
-def charger_dataset():
-    conn  = sqlite3.connect(DB_PATH)
-    df    = pd.read_sql("SELECT * FROM sp500_extreme_features",
-                         conn, index_col='date', parse_dates=['date'])
-    feats = pd.read_sql("SELECT feature FROM features_extremes",
-                         conn)['feature'].tolist()
+def charger_donnees():
+    conn = sqlite3.connect(DB_PATH)
+    df   = pd.read_sql("SELECT * FROM sp500_ml_features",
+                        conn, index_col='date', parse_dates=['date'])
+
+    # Prix bruts pour calculs techniques
+    sp   = pd.read_sql("SELECT * FROM sp500_prices ORDER BY date",
+                        conn, index_col='date', parse_dates=['date'])
+    vix  = pd.read_sql("SELECT date, close as vix_close FROM vix_prices ORDER BY date",
+                        conn, index_col='date', parse_dates=['date'])
     conn.close()
+
     df.sort_index(inplace=True)
-    feats = [f for f in feats if f in df.columns]
-    return df, feats
+    sp.sort_index(inplace=True)
+    sp.columns = [c.lower() for c in sp.columns]
 
-# ─────────────────────────────────────────
-# 2. NETTOYAGE
-# ─────────────────────────────────────────
-def preparer_X(df, feat_cols):
-    cols = [c for c in feat_cols if c in df.columns]
-    X    = df[cols].copy()
-    X.replace([np.inf, -np.inf], np.nan, inplace=True)
-    for col in X.columns:
-        if X[col].isna().any():
-            X[col].fillna(X[col].median(), inplace=True)
-        q1, q99 = X[col].quantile(0.01), X[col].quantile(0.99)
-        X[col]  = X[col].clip(q1, q99)
-    return X.values, cols
+    # Enrichissement minimal
+    if 'vix_close' in df.columns:
+        df['delta_vix']           = df['vix_close'].diff(1)
+        df['vix_pct_rank']        = df['vix_close'].rolling(252, min_periods=60).rank(pct=True)
+        df['rolling_corr_sp_vix'] = df['ret_1d'].rolling(20).corr(df['vix_ret_1d'])
+        df['vix_mean_reversion']  = (df['vix_close'] /
+                                     df['vix_close'].rolling(252, min_periods=60).mean() - 1)
 
-# ─────────────────────────────────────────
-# 3. OPTUNA
-# ─────────────────────────────────────────
-def optimiser(X_tr, y_tr, n_trials=N_TRIALS):
-    if not OPTUNA_OK:
-        return None
-    print(f"  Optuna : {n_trials} essais...")
-    tscv = TimeSeriesSplit(n_splits=5)
-    cw   = compute_class_weight('balanced', classes=np.array([0,1]), y=y_tr)
-    sw   = np.where(y_tr==1, cw[1], cw[0])
-
-    def obj(trial):
-        p = {
-            'n_estimators':     trial.suggest_int('n', 200, 800),
-            'max_depth':        trial.suggest_int('d', 2, 7),
-            'learning_rate':    trial.suggest_float('lr', 0.005, 0.15, log=True),
-            'subsample':        trial.suggest_float('ss', 0.5, 0.95),
-            'colsample_bytree': trial.suggest_float('cs', 0.5, 0.95),
-            'min_child_weight': trial.suggest_int('mcw', 5, 60),
-            'gamma':            trial.suggest_float('g', 0, 0.5),
-            'reg_alpha':        trial.suggest_float('a', 0, 1),
-            'reg_lambda':       trial.suggest_float('l', 0.5, 3),
-        }
-        sp = max(0.3, (y_tr==0).sum()/max(1,(y_tr==1).sum()))
-        scores = []
-        for tr_i, va_i in tscv.split(X_tr):
-            if len(np.unique(y_tr[va_i])) < 2:
-                continue
-            sc  = StandardScaler()
-            Xtr = np.nan_to_num(sc.fit_transform(X_tr[tr_i]))
-            Xva = np.nan_to_num(sc.transform(X_tr[va_i]))
-            m   = xgb.XGBClassifier(**p, scale_pos_weight=sp,
-                                     eval_metric='auc',
-                                     use_label_encoder=False,
-                                     random_state=42, n_jobs=-1, verbosity=0)
-            m.fit(Xtr, y_tr[tr_i], sample_weight=sw[tr_i], verbose=False)
-            scores.append(roc_auc_score(y_tr[va_i], m.predict_proba(Xva)[:,1]))
-        return np.mean(scores) if scores else 0.5
-
-    study = optuna.create_study(direction='maximize',
-                                 sampler=optuna.samplers.TPESampler(seed=42))
-    study.optimize(obj, n_trials=n_trials, show_progress_bar=False)
-    bp = study.best_params
-    print(f"  Meilleure AUC CV : {study.best_value:.4f}")
-    return {
-        'n_estimators':     bp['n'],
-        'max_depth':        bp['d'],
-        'learning_rate':    bp['lr'],
-        'subsample':        bp['ss'],
-        'colsample_bytree': bp['cs'],
-        'min_child_weight': bp['mcw'],
-        'gamma':            bp['g'],
-        'reg_alpha':        bp['a'],
-        'reg_lambda':       bp['l'],
-    }
-
-# ─────────────────────────────────────────
-# 4. ENTRAÎNEMENT UN MODÈLE
-# ─────────────────────────────────────────
-def entrainer_modele(X_tr, y_tr, X_te, y_te, feat_cols, nom):
-    print(f"\n  {'─'*50}")
-    print(f"  Modèle : {nom}")
-    print(f"  Train : {len(X_tr)}j | Test : {len(X_te)}j")
-    print(f"  Positifs train : {y_tr.mean()*100:.1f}% | test : {y_te.mean()*100:.1f}%")
-
-    scaler = StandardScaler()
-    X_tr_s = np.nan_to_num(scaler.fit_transform(X_tr))
-    X_te_s = np.nan_to_num(scaler.transform(X_te))
-
-    sp = max(0.3, (y_tr==0).sum() / max(1,(y_tr==1).sum()))
-    cw = compute_class_weight('balanced', classes=np.array([0,1]), y=y_tr)
-    sw = np.where(y_tr==1, cw[1], cw[0])
-
-    # Optuna
-    best_p = optimiser(X_tr_s, y_tr) or {
-        'n_estimators': 400, 'max_depth': 4, 'learning_rate': 0.03,
-        'subsample': 0.75, 'colsample_bytree': 0.75,
-        'min_child_weight': 15, 'gamma': 0.1,
-        'reg_alpha': 0.1, 'reg_lambda': 1.0,
-    }
-
-    # XGBoost
-    xgb_base = xgb.XGBClassifier(
-        **best_p, scale_pos_weight=sp,
-        eval_metric='auc', use_label_encoder=False,
-        random_state=42, n_jobs=-1
+    df['zscore_price_60d'] = (
+        (df['close'] - df['close'].rolling(60).mean()) /
+        df['close'].rolling(60).std()
     )
-    xgb_base.fit(X_tr_s, y_tr, sample_weight=sw, verbose=False)
+    if 'drawdown_20d' not in df.columns:
+        df['drawdown_20d'] = (df['close'] / df['close'].rolling(20).max() - 1) * 100
+    if 'drawdown_50d' not in df.columns:
+        df['drawdown_50d'] = (df['close'] / df['close'].rolling(50).max() - 1) * 100
 
-    tscv  = TimeSeriesSplit(n_splits=3)
-    xgb_m = CalibratedClassifierCV(xgb_base, method='isotonic', cv=tscv)
-    xgb_m.fit(X_tr_s, y_tr)
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    df.ffill(inplace=True)
 
-    # Random Forest
-    rf_m = RandomForestClassifier(
-        n_estimators=500, max_depth=best_p['max_depth'],
-        min_samples_leaf=15, max_features='sqrt',
-        class_weight='balanced', random_state=42, n_jobs=-1
+    return df, sp, vix
+
+
+# ─────────────────────────────────────────────────────────────
+# 2. SCORE DE TENDANCE TECHNIQUE (sans ML)
+# ─────────────────────────────────────────────────────────────
+
+def score_technique(df_row, df_hist, horizon='court'):
+    """
+    Calcule un score de tendance purement technique.
+    Retourne un score entre -100 (très baissier) et +100 (très haussier).
+
+    Court  terme (5j)  : momentum, RSI, MACD
+    Moyen  terme (20j) : moyennes mobiles, Bollinger, tendance
+    Long   terme (60j) : structure de marché, MA200, momentum long
+    """
+    close = df_hist['close']
+    idx   = df_row.name
+
+    # Données jusqu'à aujourd'hui uniquement (zero leakage)
+    hist = df_hist.loc[:idx]
+    if len(hist) < 200:
+        return 0, {}
+
+    score      = 0
+    composants = {}
+
+    if horizon == 'court':
+        # ── RSI 14 ───────────────────────────────────────────────
+        rsi = df_row.get('rsi_14', 50)
+        if   rsi > 60: s_rsi = +20
+        elif rsi > 50: s_rsi = +10
+        elif rsi < 40: s_rsi = -20
+        elif rsi < 50: s_rsi = -10
+        else:          s_rsi = 0
+        composants['RSI'] = s_rsi
+
+        # ── MACD histogram ──────────────────────────────────────
+        macd_h = df_row.get('macd_hist', 0)
+        if   macd_h > 0 and df_row.get('macd_hist', 0) > 0: s_macd = +20
+        elif macd_h > 0:                                      s_macd = +10
+        elif macd_h < 0:                                      s_macd = -20
+        else:                                                  s_macd = 0
+        composants['MACD'] = s_macd
+
+        # ── Momentum 5 jours ────────────────────────────────────
+        ret5 = df_row.get('ret_5d', 0)
+        if   ret5 > 0.02:  s_mom = +20
+        elif ret5 > 0:     s_mom = +10
+        elif ret5 < -0.02: s_mom = -20
+        else:              s_mom = -10
+        composants['Momentum 5j'] = s_mom
+
+        # ── VIX ──────────────────────────────────────────────────
+        vix = df_row.get('vix_close', 20)
+        if   vix < 15:  s_vix = +20
+        elif vix < 20:  s_vix = +10
+        elif vix < 25:  s_vix = -10
+        elif vix < 30:  s_vix = -20
+        else:           s_vix = -40
+        composants['VIX'] = s_vix
+
+        # ── Stochastique ─────────────────────────────────────────
+        stoch = df_row.get('stoch_k', 50) if 'stoch_k' in df_row.index else 50
+        if   stoch > 70: s_stoch = +20
+        elif stoch > 50: s_stoch = +10
+        elif stoch < 30: s_stoch = -20
+        else:            s_stoch = -10
+        composants['Stochastique'] = s_stoch
+
+        score = sum(composants.values())
+
+    elif horizon == 'moyen':
+        # ── Prix vs MA20 ─────────────────────────────────────────
+        p_ma20 = df_row.get('prix_vs_ma20', 0)
+        if   p_ma20 > 0.02:  s_ma20 = +20
+        elif p_ma20 > 0:     s_ma20 = +10
+        elif p_ma20 < -0.02: s_ma20 = -20
+        else:                s_ma20 = -10
+        composants['Prix/MA20'] = s_ma20
+
+        # ── Prix vs MA50 ─────────────────────────────────────────
+        p_ma50 = df_row.get('prix_vs_ma50', 0)
+        if   p_ma50 > 0.03:  s_ma50 = +20
+        elif p_ma50 > 0:     s_ma50 = +10
+        elif p_ma50 < -0.03: s_ma50 = -20
+        else:                s_ma50 = -10
+        composants['Prix/MA50'] = s_ma50
+
+        # ── Bollinger %B ─────────────────────────────────────────
+        bb_z = df_row.get('bb_zscore', 0)
+        if   bb_z > 1.5:  s_bb = +20
+        elif bb_z > 0.5:  s_bb = +10
+        elif bb_z < -1.5: s_bb = -20
+        elif bb_z < -0.5: s_bb = -10
+        else:             s_bb = 0
+        composants['Bollinger'] = s_bb
+
+        # ── MA20 vs MA50 (golden/death cross) ───────────────────
+        ma_ratio = df_row.get('ratio_20_50', 1)
+        if   ma_ratio > 1.02: s_cross = +20
+        elif ma_ratio > 1.00: s_cross = +10
+        elif ma_ratio < 0.98: s_cross = -20
+        else:                 s_cross = -10
+        composants['MA20/MA50'] = s_cross
+
+        # ── Volatilité (vol basse = tendance stable) ─────────────
+        vol_r = df_row.get('vol_ratio_5_20', 1) if 'vol_ratio_5_20' in df_row.index else 1
+        if   vol_r < 0.8: s_vol = +20   # vol en contraction = tendance forte
+        elif vol_r < 1.0: s_vol = +10
+        elif vol_r > 1.5: s_vol = -20   # vol en expansion = danger
+        else:             s_vol = -10
+        composants['Volatilité'] = s_vol
+
+        score = sum(composants.values())
+
+    else:  # long terme
+        # ── Prix vs MA200 ────────────────────────────────────────
+        p_ma200 = df_row.get('prix_vs_ma200', 0)
+        if   p_ma200 > 0.05:  s_ma200 = +30
+        elif p_ma200 > 0:     s_ma200 = +15
+        elif p_ma200 < -0.05: s_ma200 = -30
+        else:                 s_ma200 = -15
+        composants['Prix/MA200'] = s_ma200
+
+        # ── MA50 vs MA200 (tendance longue) ──────────────────────
+        ma_r_long = df_row.get('ratio_50_200', 1)
+        if   ma_r_long > 1.03: s_long = +30
+        elif ma_r_long > 1.00: s_long = +15
+        elif ma_r_long < 0.97: s_long = -30
+        else:                  s_long = -15
+        composants['MA50/MA200'] = s_long
+
+        # ── Momentum long terme (60j) ────────────────────────────
+        mom60 = df_row.get('ret_20d', 0)  # approximation
+        if   mom60 > 0.05:  s_m60 = +20
+        elif mom60 > 0:     s_m60 = +10
+        elif mom60 < -0.05: s_m60 = -20
+        else:               s_m60 = -10
+        composants['Momentum long'] = s_m60
+
+        # ── Drawdown depuis le sommet ─────────────────────────────
+        dd = df_row.get('drawdown_20d', 0)
+        if   dd > -3:   s_dd = +20
+        elif dd > -10:  s_dd = +10
+        elif dd > -20:  s_dd = -20
+        else:           s_dd = -30
+        composants['Drawdown'] = s_dd
+
+        score = sum(composants.values())
+
+    # Normaliser entre -100 et +100
+    n_composants = len(composants)
+    max_possible = n_composants * 30
+    score_norm   = max(-100, min(100, score / max_possible * 100))
+
+    return round(score_norm, 1), composants
+
+
+# ─────────────────────────────────────────────────────────────
+# 3. SCORE ML (depuis les modèles entraînés)
+# ─────────────────────────────────────────────────────────────
+
+def score_ml(df, regime):
+    """
+    Retourne la probabilité de hausse du modèle ML pour
+    le dernier jour disponible.
+    """
+    try:
+        modeles  = joblib.load(f"models/ensemble_{regime}.pkl")
+        scaler   = joblib.load(f"models/scaler_{regime}.pkl")
+        features = joblib.load(f"models/features_{regime}.pkl")
+    except FileNotFoundError:
+        return 0.5, 0.5
+
+    derniere    = df.iloc[[-1]]
+    feats_dispo = [f for f in features if f in derniere.columns]
+    X           = derniere[feats_dispo].values
+    X_scaled    = scaler.transform(X)
+
+    poids  = {'rf': 0.30, 'xgb': 0.50, 'lr': 0.20}
+    proba  = 0.0
+    for nom, m in modeles.items():
+        p = m['model'].predict_proba(X_scaled)[0, 1]
+        w = poids.get(nom, 0.33)
+        proba += p * w
+
+    return proba, proba * 2 - 1   # proba [0,1] et score [-1,+1]
+
+
+# ─────────────────────────────────────────────────────────────
+# 4. ANALYSE DE TENDANCE COMPLÈTE
+# ─────────────────────────────────────────────────────────────
+
+def analyser_tendance(df, sp):
+    """
+    Combine ML + technique sur 3 horizons.
+    Retourne un rapport complet de tendance.
+    """
+    derniere   = df.iloc[-1]
+    date_actuelle = df.index[-1]
+    vix_actuel = derniere.get('vix_close', 20)
+    regime     = ('crash'  if vix_actuel >= 30 else
+                  'stress' if vix_actuel >= 20 else 'calme')
+    close_actuel = derniere['close']
+
+    # ── Scores techniques par horizon ───────────────────────────
+    score_ct, comp_ct = score_technique(derniere, sp, 'court')
+    score_mt, comp_mt = score_technique(derniere, sp, 'moyen')
+    score_lt, comp_lt = score_technique(derniere, sp, 'long')
+
+    # ── Score ML ────────────────────────────────────────────────
+    proba_ml, score_ml_norm = score_ml(df, regime)
+
+    # ── Score ML converti en -100/+100 ──────────────────────────
+    score_ml_100 = round((proba_ml - 0.5) * 200, 1)
+
+    # ── Score composite global ───────────────────────────────────
+    # Pondération : CT=20%, MT=30%, LT=25%, ML=25%
+    score_global = (
+        score_ct    * 0.20 +
+        score_mt    * 0.30 +
+        score_lt    * 0.25 +
+        score_ml_100* 0.25
     )
-    rf_m.fit(X_tr_s, y_tr)
 
-    # Ensemble pondéré
-    p_xgb   = xgb_m.predict_proba(X_te_s)[:,1]
-    p_rf    = rf_m.predict_proba(X_te_s)[:,1]
-    auc_xgb = roc_auc_score(y_te, p_xgb)
-    auc_rf  = roc_auc_score(y_te, p_rf)
-    tot     = auc_xgb + auc_rf
-    w_xgb   = auc_xgb/tot if tot>0 else 0.5
-    w_rf    = auc_rf/tot  if tot>0 else 0.5
-    probas  = w_xgb*p_xgb + w_rf*p_rf
-    auc_ens = roc_auc_score(y_te, probas)
+    # ── Label de tendance ────────────────────────────────────────
+    def label_tendance(score, horizon=""):
+        if   score >= 60:  return f"FORTEMENT HAUSSIÈRE  ▲▲"
+        elif score >= 25:  return f"HAUSSIÈRE            ▲"
+        elif score >= 5:   return f"LÉGÈREMENT HAUSSIÈRE △"
+        elif score >= -5:  return f"NEUTRE               →"
+        elif score >= -25: return f"LÉGÈREMENT BAISSIÈRE ▽"
+        elif score >= -60: return f"BAISSIÈRE            ▼"
+        else:              return f"FORTEMENT BAISSIÈRE  ▼▼"
 
-    print(f"  AUC → XGB:{auc_xgb:.4f} | RF:{auc_rf:.4f} | Ens:{auc_ens:.4f}")
+    def conviction(score):
+        abs_s = abs(score)
+        if   abs_s >= 60: return "TRÈS FORTE"
+        elif abs_s >= 35: return "FORTE"
+        elif abs_s >= 15: return "MODÉRÉE"
+        else:             return "FAIBLE"
 
-    # Métriques à différents seuils
-    print(f"\n  Analyse par seuil de confiance :")
-    print(f"  {'Seuil':>6} | {'n signaux':>10} | {'Precision':>10} | {'Recall':>8} | {'F1':>6}")
-    print(f"  {'─'*55}")
-    for seuil in [0.45, 0.50, 0.55, 0.60, 0.65, 0.70]:
-        preds_s = (probas >= seuil).astype(int)
-        n_sig   = preds_s.sum()
-        if n_sig == 0:
-            continue
-        prec = precision_score(y_te, preds_s, zero_division=0)
-        rec  = recall_score(y_te, preds_s, zero_division=0)
-        f1   = f1_score(y_te, preds_s, zero_division=0)
-        print(f"  {seuil:>6.2f} | {n_sig:>10} | {prec:>10.4f} | {rec:>8.4f} | {f1:>6.4f}")
+    # ── Niveaux clés ─────────────────────────────────────────────
+    ma20  = sp['close'].rolling(20).mean().iloc[-1]
+    ma50  = sp['close'].rolling(50).mean().iloc[-1]
+    ma200 = sp['close'].rolling(200).mean().iloc[-1]
 
-    # Seuil optimal F1
-    best_seuil, best_f1 = 0.5, 0.0
-    for s in np.arange(0.40, 0.76, 0.01):
-        preds_s = (probas >= s).astype(int)
-        if len(np.unique(preds_s)) < 2:
-            continue
-        f1 = f1_score(y_te, preds_s, average='macro')
-        if f1 > best_f1:
-            best_f1, best_seuil = f1, s
-
-    preds = (probas >= best_seuil).astype(int)
-    acc   = accuracy_score(y_te, preds)
-    print(f"\n  Seuil optimal : {best_seuil:.2f} | Accuracy : {acc:.4f} | AUC : {auc_ens:.4f}")
-    print(classification_report(y_te, preds,
-                                  target_names=['Non-extrême','Extrême'],
-                                  zero_division=0))
-
-    # Feature importance
-    imp = pd.Series(xgb_base.feature_importances_, index=feat_cols)
-    print("  Top 10 features :")
-    for fname, fval in imp.nlargest(10).items():
-        print(f"    {fname:<35} {fval:.4f}")
+    support_1  = round(ma50 * 0.97, 2)
+    support_2  = round(ma200 * 0.98, 2)
+    resistance = round(sp['close'].rolling(20).max().iloc[-1] * 1.02, 2)
 
     return {
-        'xgb': xgb_m, 'rf': rf_m,
-        'w_xgb': w_xgb, 'w_rf': w_rf,
-        'scaler': scaler, 'seuil': best_seuil,
-        'auc': auc_ens, 'feats': feat_cols
+        'date'          : date_actuelle,
+        'close'         : close_actuel,
+        'vix'           : vix_actuel,
+        'regime'        : regime,
+
+        # Scores
+        'score_ct'      : score_ct,
+        'score_mt'      : score_mt,
+        'score_lt'      : score_lt,
+        'score_ml'      : score_ml_100,
+        'score_global'  : round(score_global, 1),
+        'proba_ml'      : proba_ml,
+
+        # Labels
+        'tendance_ct'   : label_tendance(score_ct),
+        'tendance_mt'   : label_tendance(score_mt),
+        'tendance_lt'   : label_tendance(score_lt),
+        'tendance_global': label_tendance(score_global),
+        'conviction'    : conviction(score_global),
+
+        # Composants détaillés
+        'composants_ct' : comp_ct,
+        'composants_mt' : comp_mt,
+        'composants_lt' : comp_lt,
+
+        # Niveaux
+        'ma20'          : round(ma20, 2),
+        'ma50'          : round(ma50, 2),
+        'ma200'         : round(ma200, 2),
+        'support_1'     : support_1,
+        'support_2'     : support_2,
+        'resistance'    : resistance,
     }
 
-# ─────────────────────────────────────────
-# 5. SIGNAL DU JOUR
-# ─────────────────────────────────────────
-def signal_du_jour(df, modele_up, modele_down):
-    print("\n" + "=" * 55)
-    print("  SIGNAL DU JOUR — MOUVEMENTS EXTRÊMES")
-    print("=" * 55)
 
-    last  = df.iloc[-1]
-    date  = df.index[-1].strftime('%Y-%m-%d')
-    prix  = last['close']
+# ─────────────────────────────────────────────────────────────
+# 5. AFFICHAGE DU RAPPORT
+# ─────────────────────────────────────────────────────────────
 
-    # Proba forte hausse
-    feats_up = modele_up['feats']
-    X_up     = np.array([[last.get(f,0) for f in feats_up]])
-    X_up_s   = np.nan_to_num(modele_up['scaler'].transform(X_up))
-    p_up     = (modele_up['w_xgb'] * modele_up['xgb'].predict_proba(X_up_s)[0,1] +
-                modele_up['w_rf']  * modele_up['rf'].predict_proba(X_up_s)[0,1])
+def afficher_rapport(r):
+    print("\n")
+    print("╔" + "═"*52 + "╗")
+    print("║       RAPPORT DE TENDANCE S&P 500               ║")
+    print("╠" + "═"*52 + "╣")
+    print(f"║  Date      : {str(r['date'].date()):<38}║")
+    print(f"║  Clôture   : {r['close']:>10,.2f}                          ║")
+    print(f"║  VIX       : {r['vix']:>6.1f}    Régime: {r['regime'].upper():<15}║")
+    print("╠" + "═"*52 + "╣")
 
-    # Proba forte baisse
-    feats_dn = modele_down['feats']
-    X_dn     = np.array([[last.get(f,0) for f in feats_dn]])
-    X_dn_s   = np.nan_to_num(modele_down['scaler'].transform(X_dn))
-    p_dn     = (modele_down['w_xgb'] * modele_down['xgb'].predict_proba(X_dn_s)[0,1] +
-                modele_down['w_rf']  * modele_down['rf'].predict_proba(X_dn_s)[0,1])
+    # Score global
+    sg = r['score_global']
+    barre_pos = '█' * max(0, int(abs(sg) / 5)) if sg >= 0 else ''
+    barre_neg = '█' * max(0, int(abs(sg) / 5)) if sg < 0  else ''
+    print(f"║  TENDANCE GLOBALE : {r['tendance_global']:<33}║")
+    print(f"║  Score    : {sg:>+6.1f} / 100   Conviction: {r['conviction']:<10}║")
+    print(f"║  ML P(↑)  : {r['proba_ml']*100:>5.1f}%                                 ║")
+    print("╠" + "═"*52 + "╣")
 
-    print(f"  Date  : {date}")
-    print(f"  Prix  : {prix:,.2f} pts")
-    print(f"  VIX   : {last.get('vix_close',0):.1f}")
-    print(f"  ADX   : {last.get('adx_14',0):.1f}")
-    print(f"  RSI14 : {last.get('rsi_14',50):.1f}")
-    print(f"  F&G   : {last.get('fg_index',50):.0f}")
-    print()
-    print(f"  P(FORTE HAUSSE > +1.5% / 5j) = {p_up*100:.1f}%")
-    print(f"  P(FORTE BAISSE < -1.5% / 5j) = {p_dn*100:.1f}%")
-    print()
+    # 3 horizons
+    print("║  ANALYSE MULTI-HORIZONS                         ║")
+    print("╠" + "─"*52 + "╣")
 
-    # Décision
-    if p_up >= SEUIL_ACHAT and p_up > p_dn:
-        signal = "ACHAT"
-        emoji  = "🟢"
-        detail = f"Forte hausse probable ({p_up*100:.1f}%)"
-    elif p_dn >= SEUIL_VENTE and p_dn > p_up:
-        signal = "VENTE"
-        emoji  = "🔴"
-        detail = f"Forte baisse probable ({p_dn*100:.1f}%)"
+    horizons = [
+        ("Court terme  (5j) ", r['score_ct'], r['tendance_ct']),
+        ("Moyen terme  (20j)", r['score_mt'], r['tendance_mt']),
+        ("Long terme   (60j)", r['score_lt'], r['tendance_lt']),
+        ("Modèle ML        ", r['score_ml'], f"P(hausse)={r['proba_ml']*100:.1f}%"),
+    ]
+    for label, score, tendance in horizons:
+        couleur = "↑" if score > 0 else ("↓" if score < 0 else "→")
+        print(f"║  {label} : {score:>+6.1f}  {couleur}               ║")
+
+    print("╠" + "═"*52 + "╣")
+
+    # Détail des composants
+    print("║  DÉTAIL INDICATEURS                             ║")
+    print("╠" + "─"*52 + "╣")
+    print("║  Court terme :                                  ║")
+    for nom, val in r['composants_ct'].items():
+        signe = "↑" if val > 0 else ("↓" if val < 0 else "→")
+        print(f"║    {nom:<20} {signe} {val:>+4}                      ║")
+
+    print("║  Moyen terme :                                  ║")
+    for nom, val in r['composants_mt'].items():
+        signe = "↑" if val > 0 else ("↓" if val < 0 else "→")
+        print(f"║    {nom:<20} {signe} {val:>+4}                      ║")
+
+    print("║  Long terme :                                   ║")
+    for nom, val in r['composants_lt'].items():
+        signe = "↑" if val > 0 else ("↓" if val < 0 else "→")
+        print(f"║    {nom:<20} {signe} {val:>+4}                      ║")
+
+    print("╠" + "═"*52 + "╣")
+
+    # Niveaux clés
+    print("║  NIVEAUX CLÉS                                   ║")
+    print("╠" + "─"*52 + "╣")
+    ecart_ma20  = (r['close'] / r['ma20']  - 1) * 100
+    ecart_ma50  = (r['close'] / r['ma50']  - 1) * 100
+    ecart_ma200 = (r['close'] / r['ma200'] - 1) * 100
+
+    print(f"║  MA20  : {r['ma20']:>10,.2f}  ({ecart_ma20:>+6.2f}% vs clôture)    ║")
+    print(f"║  MA50  : {r['ma50']:>10,.2f}  ({ecart_ma50:>+6.2f}% vs clôture)    ║")
+    print(f"║  MA200 : {r['ma200']:>10,.2f}  ({ecart_ma200:>+6.2f}% vs clôture)    ║")
+    print(f"║  Support 1  : {r['support_1']:>10,.2f}  (MA50 -3%)              ║")
+    print(f"║  Support 2  : {r['support_2']:>10,.2f}  (MA200 -2%)             ║")
+    print(f"║  Résistance : {r['resistance']:>10,.2f}  (Plus haut 20j +2%)     ║")
+
+    print("╠" + "═"*52 + "╣")
+
+    # Conclusion
+    sg = r['score_global']
+    if sg >= 25:
+        conclusion = ("Le marché montre des signaux HAUSSIERS clairs.\n"
+                      "║  Les indicateurs techniques et le modèle ML\n"
+                      "║  convergent vers une poursuite de la hausse.")
+    elif sg >= 5:
+        conclusion = ("Tendance légèrement positive mais sans conviction\n"
+                      "║  forte. Surveiller la MA20 comme support clé.\n"
+                      "║  Rester en position mais sans forcer.")
+    elif sg >= -5:
+        conclusion = ("Marché indécis. Pas de signal directionnel clair.\n"
+                      "║  Attendre une cassure des niveaux clés avant\n"
+                      "║  de prendre position.")
+    elif sg >= -25:
+        conclusion = ("Signaux BAISSIERS modérés. Le marché perd de\n"
+                      "║  la dynamique. Réduire l'exposition est prudent.\n"
+                      "║  Surveiller le VIX pour confirmation.")
     else:
-        signal = "NEUTRE"
-        emoji  = "🟡"
-        detail = "Pas de mouvement extrême prévu → rester en CASH"
+        conclusion = ("SIGNAUX BAISSIERS FORTS. Structure technique\n"
+                      "║  détériorée. Protection du capital prioritaire.\n"
+                      "║  Attendre stabilisation avant de racheter.")
 
-    conf_up = "HAUTE" if p_up > 0.65 else "MOYENNE" if p_up > 0.55 else "FAIBLE"
-    conf_dn = "HAUTE" if p_dn > 0.65 else "MOYENNE" if p_dn > 0.55 else "FAIBLE"
+    print(f"║  CONCLUSION                                     ║")
+    print(f"╠" + "─"*52 + "╣")
+    for ligne in conclusion.split('\n'):
+        ligne_propre = ligne.replace('║  ', '')
+        print(f"║  {ligne_propre:<50}║")
 
-    print(f"  ┌─────────────────────────────────────────┐")
-    print(f"  │  SIGNAL  →  {emoji}  {signal:<8}                  │")
-    print(f"  │  {detail:<41}│")
-    print(f"  │                                         │")
-    print(f"  │  Conf. HAUSSE : {conf_up:<6}  Conf. BAISSE : {conf_dn:<6}│")
-    print(f"  └─────────────────────────────────────────┘")
+    print("╚" + "═"*52 + "╝")
 
-    if signal == "NEUTRE":
-        print(f"\n  → Aucun mouvement extrême prévu")
-        print(f"     Attends P(hausse) > {SEUIL_ACHAT*100:.0f}% ou P(baisse) > {SEUIL_VENTE*100:.0f}%")
 
-    return signal, p_up, p_dn
+# ─────────────────────────────────────────────────────────────
+# 6. HISTORIQUE DES PRÉDICTIONS (suivi dans le temps)
+# ─────────────────────────────────────────────────────────────
 
-# ─────────────────────────────────────────
-# PIPELINE
-# ─────────────────────────────────────────
+def sauvegarder_prediction(r):
+    """
+    Sauvegarde la prédiction du jour dans un CSV historique.
+    Permet de suivre l'évolution des scores dans le temps.
+    """
+    path = "results/historique_tendances.csv"
+
+    nouvelle_ligne = {
+        'date'           : r['date'].date(),
+        'close'          : r['close'],
+        'vix'            : r['vix'],
+        'regime'         : r['regime'],
+        'score_global'   : r['score_global'],
+        'score_ct'       : r['score_ct'],
+        'score_mt'       : r['score_mt'],
+        'score_lt'       : r['score_lt'],
+        'score_ml'       : r['score_ml'],
+        'proba_ml'       : round(r['proba_ml'], 4),
+        'tendance_global': r['tendance_global'].strip(),
+        'conviction'     : r['conviction'],
+    }
+
+    if os.path.exists(path):
+        hist = pd.read_csv(path)
+        # Éviter les doublons sur la même date
+        hist = hist[hist['date'] != str(nouvelle_ligne['date'])]
+        hist = pd.concat([hist, pd.DataFrame([nouvelle_ligne])],
+                          ignore_index=True)
+    else:
+        hist = pd.DataFrame([nouvelle_ligne])
+
+    hist.to_csv(path, index=False)
+    print(f"\n  Prédiction sauvegardée → {path}")
+
+
+# ─────────────────────────────────────────────────────────────
+# 7. BACKTEST DES PRÉDICTIONS DE TENDANCE
+# ─────────────────────────────────────────────────────────────
+
+def backtest_tendance(df, sp, n_last=252):
+    """
+    Vérifie la qualité des prédictions de tendance
+    sur les N derniers jours (défaut = 1 an).
+    """
+    print(f"\n  BACKTEST TENDANCE — {n_last} derniers jours")
+    print(f"  {'─'*50}")
+
+    resultats = []
+    indices   = df.index[-n_last-5:-5]   # on garde 5j pour la vérification
+
+    for date in indices[::5]:   # vérification toutes les 5 barres (hebdo)
+        try:
+            row     = df.loc[date]
+            sp_hist = sp.loc[:date]
+            vix_val = row.get('vix_close', 20)
+            regime  = 'crash' if vix_val >= 30 else ('stress' if vix_val >= 20 else 'calme')
+
+            # Score composite simplifié pour le backtest
+            s_ct, _ = score_technique(row, sp_hist, 'court')
+            s_mt, _ = score_technique(row, sp_hist, 'moyen')
+            score   = s_ct * 0.4 + s_mt * 0.6
+
+            # Vérification 5 jours après
+            date_verif = df.index[df.index.get_loc(date) + 5] \
+                         if df.index.get_loc(date) + 5 < len(df) else None
+
+            if date_verif is None:
+                continue
+
+            ret_5j = df.loc[date_verif, 'close'] / df.loc[date, 'close'] - 1
+
+            # Prédiction correcte si score et réalité dans le même sens
+            pred_correct = (score > 0 and ret_5j > 0) or (score < 0 and ret_5j < 0)
+
+            resultats.append({
+                'date'        : date,
+                'score'       : score,
+                'ret_5j_reel' : ret_5j,
+                'correct'     : pred_correct
+            })
+        except Exception:
+            continue
+
+    if not resultats:
+        print("  Pas assez de données pour le backtest.")
+        return
+
+    res_df    = pd.DataFrame(resultats)
+    precision = res_df['correct'].mean() * 100
+    n_pred    = len(res_df)
+    n_correct = res_df['correct'].sum()
+
+    # Précision par niveau de conviction
+    res_df['abs_score'] = res_df['score'].abs()
+    res_df['conviction'] = pd.cut(res_df['abs_score'],
+                                   bins=[0, 20, 40, 100],
+                                   labels=['Faible', 'Modérée', 'Forte'])
+
+    print(f"  Prédictions testées : {n_pred}")
+    print(f"  Précision globale   : {precision:.1f}%")
+    print(f"\n  Par niveau de conviction :")
+
+    for conv in ['Faible', 'Modérée', 'Forte']:
+        mask = res_df['conviction'] == conv
+        if mask.sum() > 0:
+            prec = res_df.loc[mask, 'correct'].mean() * 100
+            n    = mask.sum()
+            print(f"    {conv:<10} : {prec:.1f}%  ({n} prédictions)")
+
+
+# ─────────────────────────────────────────────────────────────
+# EXÉCUTION
+# ─────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
     print("=" * 55)
-    print("  MODULE 2 — MOUVEMENTS EXTRÊMES S&P500")
+    print("  PRÉDICTION DE TENDANCE S&P500")
+    print(f"  {datetime.now().strftime('%d/%m/%Y %H:%M')}")
     print("=" * 55)
 
-    df, feats = charger_dataset()
-    print(f"Dataset : {len(df)}j × {df.shape[1]} colonnes")
+    # Chargement
+    print("\nChargement des données...")
+    df, sp, vix = charger_donnees()
+    print(f"  Données : {df.index[0].date()} → {df.index[-1].date()}")
+    print(f"  Dernier cours S&P500 : {df['close'].iloc[-1]:,.2f}")
 
-    n_up   = df['target_up'].sum()
-    n_down = df['target_down'].sum()
-    n_neut = len(df) - n_up - n_down
-    print(f"Classes : HAUSSE={n_up} ({n_up/len(df)*100:.1f}%) | "
-          f"BAISSE={n_down} ({n_down/len(df)*100:.1f}%) | "
-          f"NEUTRE={n_neut} ({n_neut/len(df)*100:.1f}%)")
+    # Analyse de tendance
+    print("\nAnalyse en cours...")
+    rapport = analyser_tendance(df, sp)
 
-    # Split temporel 80/20
-    split    = int(len(df) * 0.80)
-    df_train = df.iloc[:split]
-    df_test  = df.iloc[split:]
-    print(f"Split : Train={len(df_train)}j | Test={len(df_test)}j")
-
-    X_train, cols = preparer_X(df_train, feats)
-    X_test,  _    = preparer_X(df_test,  feats)
-
-    # ── Modèle FORTE HAUSSE ───────────────────────────────────
-    print("\n" + "=" * 55)
-    print("  MODÈLE 1 — FORTE HAUSSE (> +1.5% / 5j)")
-    print("=" * 55)
-    y_tr_up = df_train['target_up'].values
-    y_te_up = df_test['target_up'].values
-    mod_up  = entrainer_modele(X_train, y_tr_up, X_test, y_te_up, cols, "FORTE_HAUSSE")
-
-    # ── Modèle FORTE BAISSE ───────────────────────────────────
-    print("\n" + "=" * 55)
-    print("  MODÈLE 2 — FORTE BAISSE (< -1.5% / 5j)")
-    print("=" * 55)
-    y_tr_dn = df_train['target_down'].values
-    y_te_dn = df_test['target_down'].values
-    mod_dn  = entrainer_modele(X_train, y_tr_dn, X_test, y_te_dn, cols, "FORTE_BAISSE")
+    # Affichage
+    afficher_rapport(rapport)
 
     # Sauvegarde
-    joblib.dump(mod_up, "models/modele_extreme_hausse.pkl")
-    joblib.dump(mod_dn, "models/modele_extreme_baisse.pkl")
-    joblib.dump({'seuil_achat': SEUIL_ACHAT, 'seuil_vente': SEUIL_VENTE,
-                  'seuil_mouvement': 0.015, 'horizon': 5},
-                "models/extreme_params.pkl")
-    print("\n  Modèles sauvegardés ✓")
+    sauvegarder_prediction(rapport)
 
-    # Signal du jour
-    signal_du_jour(df, mod_up, mod_dn)
+    # Backtest qualité des prédictions
+    print("\n" + "="*55)
+    backtest_tendance(df, sp, n_last=252)
 
-    print("\nModule 2 terminé ✓")
-    print("Prochaine étape : python 7_backtest.py")
+    print("\n" + "="*55)
+    print("  Terminé ✓")
+    print("  Fichiers générés :")
+    print("    results/historique_tendances.csv")
+    print("="*55)

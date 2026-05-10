@@ -11,11 +11,12 @@ os.makedirs("data", exist_ok=True)
 DB_PATH = "data/market_data.db"
 
 actifs = {
-    'sp500': '^GSPC',
-    'vix'  : '^VIX',
-    
+    'sp500'  : '^GSPC',
+    'vix'    : '^VIX',
+    'bitcoin': 'BTC-USD',
+    'gold'   : 'GC=F',
+    'dxy'    : 'DX-Y.NYB'
 }
-
 def get_connection():
     return sqlite3.connect(DB_PATH)
 
@@ -78,8 +79,7 @@ def telecharger_et_stocker(nom, ticker):
     raw = yf.download(ticker, start="2000-01-01", interval='1d', progress=False)
 
 # ── INTRADAY (optionnel pour futur)
-    raw_1h = yf.download(ticker, period='730d', interval='1h', progress=False)
-    raw_15min = yf.download(ticker, period='60d', interval='15m', progress=False)
+
     if isinstance(raw.columns, pd.MultiIndex):
         raw.columns = raw.columns.get_level_values(0)
 

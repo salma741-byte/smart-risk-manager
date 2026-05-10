@@ -254,8 +254,12 @@ def creer_cible_extreme(df, seuil=SEUIL, horizon=5):
     # Cible binaire : forte hausse vs reste
     df['target_up']   = (df['classe_extreme'] == 2).astype(int)
     # Cible binaire : forte baisse vs reste
-    df['target_down'] = (df['classe_extreme'] == 0).astype(int)
-
+    baisse_regime = (
+    (df['close'] < df['ma_50']) &
+    (df['ma_50'] < df['ma_200']) &
+    (df['rsi_14'] < 45)
+).astype(int)
+    df['target_down'] = baisse_regime
     n_up   = (df['classe_extreme'] == 2).sum()
     n_neut = (df['classe_extreme'] == 1).sum()
     n_down = (df['classe_extreme'] == 0).sum()
