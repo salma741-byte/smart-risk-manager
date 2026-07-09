@@ -1,899 +1,876 @@
 # ============================================================
-#  dashboard_live.py — Dashboard Live S&P500 ML Predictor
+#  dashboard_v2.py  —  S&P 500 ML Predictor · Live Dashboard
+#  Version propre — corrige tous les bugs précédents
 #
-#  Lance : python dashboard_live.py
-#  Ouvre : http://localhost:5000
-#
-#  Dépendances : pip install flask
+#  Installation : pip install flask
+#  Lancement    : python dashboard_v2.py
+#  URL          : http://localhost:5000
 # ============================================================
 
-import sqlite3
-import json
-import os
-import joblib
+import os, json, sqlite3, joblib
 import numpy as np
 import pandas as pd
 from datetime import datetime
 from flask import Flask, jsonify, render_template_string
 
-app = Flask(__name__)
+app     = Flask(__name__)
 DB_PATH = "data/market_data.db"
 
-
 # ─────────────────────────────────────────────────────────────
-# UTILITAIRES
+# HELPERS
 # ─────────────────────────────────────────────────────────────
 
-def get_conn():
+def db():
     return sqlite3.connect(DB_PATH)
 
-
-def safe_float(val, decimals=2):
-    try:
-        return round(float(val), decimals)
-    except Exception:
-        return 0.0
-
+def f(v, d=2):
+    try:    return round(float(v), d)
+    except: return 0.0
 
 # ─────────────────────────────────────────────────────────────
-# DONNÉES MARCHÉ EN TEMPS RÉEL (depuis SQLite)
+# 1. DONNÉES MARCHÉ
 # ─────────────────────────────────────────────────────────────
 
-def get_market_data():
-    conn = get_conn()
-    result = {}
-
+def marche():
     actifs = {
-        'sp500'  : ('^GSPC',  'S&P 500'),
-        'vix'    : ('^VIX',   'VIX'),
-        'bitcoin': ('BTC-USD','Bitcoin'),
-        'gold'   : ('GC=F',   'Or'),
-        'dxy'    : ('DX-Y.NYB','Dollar DXY'),
+        'sp500':   ('^GSPC',    'S&P 500'),
+        'vix':     ('^VIX',     'VIX'),
+        'bitcoin': ('BTC-USD',  'Bitcoin'),
+        'gold':    ('GC=F',     'Or'),
+        'dxy':     ('DX-Y.NYB', 'Dollar'),
     }
-
-    for nom, (ticker, label) in actifs.items():
-        try:
-            df = pd.read_sql(
-                f"SELECT date, close FROM {nom}_prices ORDER BY date DESC LIMIT 2",
-                conn
-            )
-            if len(df) >= 2:
-                prix_actuel  = safe_float(df['close'].iloc[0])
-                prix_veille  = safe_float(df['close'].iloc[1])
-                variation    = safe_float((prix_actuel - prix_veille) / prix_veille * 100)
-                date_str     = str(df['date'].iloc[0])[:10]
-            elif len(df) == 1:
-                prix_actuel  = safe_float(df['close'].iloc[0])
-                variation    = 0.0
-                date_str     = str(df['date'].iloc[0])[:10]
-            else:
-                prix_actuel  = 0.0
-                variation    = 0.0
-                date_str     = "N/A"
-
-            result[nom] = {
-                'ticker'   : ticker,
-                'label'    : label,
-                'prix'     : prix_actuel,
-                'variation': variation,
-                'date'     : date_str,
-            }
-        except Exception as e:
-            result[nom] = {'ticker': ticker, 'label': label,
-                           'prix': 0.0, 'variation': 0.0, 'date': 'N/A'}
-
-    conn.close()
-    return result
-
-
-# ─────────────────────────────────────────────────────────────
-# SIGNAL ML DEPUIS LES MODÈLES SAUVEGARDÉS
-# ─────────────────────────────────────────────────────────────
-
-def get_ml_signal():
+    out = {}
     try:
-        conn = get_conn()
-        df   = pd.read_sql(
-            "SELECT * FROM sp500_ml_features ORDER BY date DESC LIMIT 1",
-            conn, parse_dates=['date']
-        )
+        conn = db()
+        for nom, (ticker, label) in actifs.items():
+            try:
+                rows = pd.read_sql(
+                    f"SELECT close FROM {nom}_prices ORDER BY date DESC LIMIT 2",
+                    conn)
+                p0 = f(rows['close'].iloc[0]) if len(rows) > 0 else 0
+                p1 = f(rows['close'].iloc[1]) if len(rows) > 1 else p0
+                out[nom] = {
+                    'ticker': ticker, 'label': label,
+                    'prix': p0,
+                    'var':  f((p0 - p1) / p1 * 100) if p1 else 0,
+                }
+            except:
+                out[nom] = {'ticker': ticker, 'label': label, 'prix': 0, 'var': 0}
+        conn.close()
+    except Exception as e:
+        print(f"Erreur marché: {e}")
+    return out
+
+
+# ─────────────────────────────────────────────────────────────
+# 2. SIGNAL ML
+# ─────────────────────────────────────────────────────────────
+
+def signal_ml():
+    DEFAULT = {'vix': 0, 'regime': 'calme', 'proba': 50,
+               'expo': 60, 'signal': 'N/A', 'couleur': 'gray',
+               'score': 0, 'conviction': 'FAIBLE', 'ok': False, 'date': '---'}
+    try:
+        conn = db()
+        df   = pd.read_sql("SELECT * FROM sp500_ml_features ORDER BY date DESC LIMIT 300",
+                           conn, parse_dates=['date'])
         conn.close()
 
         if df.empty:
-            return default_signal()
+            return DEFAULT
 
-        # Enrichissement
-        if 'vix_close' in df.columns:
-            conn2 = get_conn()
-            vix_hist = pd.read_sql(
-                "SELECT date, close FROM vix_prices ORDER BY date",
-                conn2, parse_dates=['date']
-            ).set_index('date')
-            conn2.close()
+        row = df.iloc[[0]].copy()
 
-            vix_val = safe_float(df['vix_close'].iloc[0])
-            vix_pct = safe_float(
-                (vix_hist['close'] <= vix_val).mean() * 100
-            )
+        # VIX et régime
+        vix_val = f(row['vix_close'].iloc[0]) if 'vix_close' in row.columns else 20.0
+        regime  = 'crash' if vix_val >= 30 else 'stress' if vix_val >= 20 else 'calme'
+
+        # Enrichissement — delta_vix, rolling_corr, zscore_60d
+        if 'vix_close' in df.columns and len(df) >= 2:
+            row['delta_vix']           = float(df['vix_close'].iloc[0] - df['vix_close'].iloc[1])
+            row['rolling_corr_sp_vix'] = float(df['ret_1d'].corr(df['vix_ret_1d'])) if 'vix_ret_1d' in df.columns else 0.0
+            row['vix_mean_reversion']  = 0.0
+            row['vix_pct_rank']        = float((df['vix_close'] <= vix_val).mean())
         else:
-            vix_val = 20.0
-            vix_pct = 50.0
+            for c in ['delta_vix','rolling_corr_sp_vix','vix_mean_reversion','vix_pct_rank']:
+                row[c] = 0.0
 
-        regime = ('crash'  if vix_val >= 30 else
-                  'stress' if vix_val >= 20 else 'calme')
+        if 'close' in df.columns and len(df) >= 60:
+            mu = df['close'].iloc[:60].mean()
+            sd = df['close'].iloc[:60].std()
+            row['zscore_price_60d'] = float((df['close'].iloc[0] - mu) / sd) if sd else 0.0
+        else:
+            row['zscore_price_60d'] = 0.0
 
-        # Charger modèle
+        for c in ['drawdown_20d', 'drawdown_50d']:
+            if c not in row.columns:
+                row[c] = 0.0
+
+        row.replace([np.inf, -np.inf], np.nan, inplace=True)
+        row.fillna(0, inplace=True)
+
+        # Modèle
         modeles  = joblib.load(f"models/ensemble_{regime}.pkl")
         scaler   = joblib.load(f"models/scaler_{regime}.pkl")
         features = joblib.load(f"models/features_{regime}.pkl")
 
-        feats_dispo = [f for f in features if f in df.columns]
-        X           = df[feats_dispo].values.astype(np.float64)
-        X_scaled    = scaler.transform(X)
+        feats = [x for x in features if x in row.columns]
+        X     = row[feats].values.astype(np.float64)
+        Xs    = scaler.transform(X)
 
-        poids  = {'rf': 0.30, 'xgb': 0.50, 'lr': 0.20}
-        proba  = 0.0
-        for nom, m in modeles.items():
-            p = m['model'].predict_proba(X_scaled)[0, 1]
-            proba += p * poids.get(nom, 0.33)
+        poids = {'rf': 0.30, 'xgb': 0.50, 'lr': 0.20}
+        proba = sum(m['model'].predict_proba(Xs)[0, 1] * poids.get(n, 0.33)
+                    for n, m in modeles.items())
 
-        # Exposition
+        # Signal
         if regime == 'calme':
-            if   proba >= 0.65: expo = 1.0;  signal = "FORT ACHAT";  couleur = "green"
-            elif proba >= 0.60: expo = 0.8;  signal = "ACHAT";       couleur = "green"
-            elif proba >= 0.55: expo = 0.6;  signal = "ACHAT";       couleur = "green"
-            elif proba >= 0.50: expo = 0.4;  signal = "RÉDUIT";      couleur = "amber"
-            elif proba >= 0.44: expo = 0.3;  signal = "RÉDUIT";      couleur = "amber"
-            else:               expo = 0.0;  signal = "NEUTRE";      couleur = "gray"
+            if   proba >= 0.65: expo=100; sig='FORT ACHAT'; col='green'
+            elif proba >= 0.60: expo=80;  sig='ACHAT';      col='green'
+            elif proba >= 0.55: expo=60;  sig='ACHAT';      col='green'
+            elif proba >= 0.50: expo=40;  sig='REDUIT';     col='amber'
+            elif proba >= 0.44: expo=30;  sig='REDUIT';     col='amber'
+            else:               expo=0;   sig='NEUTRE';     col='gray'
         elif regime == 'stress':
-            if   proba >= 0.58: expo = 0.8;  signal = "ACHAT";       couleur = "green"
-            elif proba >= 0.52: expo = 0.5;  signal = "ACHAT";       couleur = "green"
-            elif proba >= 0.45: expo = 0.3;  signal = "RÉDUIT";      couleur = "amber"
-            elif proba >= 0.38: expo = 0.0;  signal = "NEUTRE";      couleur = "gray"
-            else:               expo = -0.2; signal = "SHORT";       couleur = "red"
-        else:  # crash
-            if   proba >= 0.65: expo = 0.5;  signal = "ACHAT TIMIDE";couleur = "amber"
-            elif proba >= 0.55: expo = 0.2;  signal = "RÉDUIT";      couleur = "amber"
-            else:               expo = 0.0;  signal = "NEUTRE";      couleur = "gray"
+            if   proba >= 0.58: expo=80;  sig='ACHAT';      col='green'
+            elif proba >= 0.52: expo=50;  sig='ACHAT';      col='green'
+            elif proba >= 0.45: expo=30;  sig='REDUIT';     col='amber'
+            elif proba >= 0.38: expo=0;   sig='NEUTRE';     col='gray'
+            else:               expo=-20; sig='SHORT';      col='red'
+        else:
+            if   proba >= 0.65: expo=50;  sig='ACHAT TIMIDE';col='amber'
+            elif proba >= 0.55: expo=20;  sig='REDUIT';      col='amber'
+            else:               expo=0;   sig='NEUTRE';      col='gray'
 
-        # Score conviction
         score = (proba - 0.5) * 200
-        if   abs(score) >= 35: conviction = "FORTE"
-        elif abs(score) >= 15: conviction = "MODÉRÉE"
-        else:                  conviction = "FAIBLE"
+        conv  = 'FORTE' if abs(score) >= 35 else 'MODEREE' if abs(score) >= 15 else 'FAIBLE'
+        date  = str(df['date'].iloc[0])[:10]
 
-        return {
-            'date'       : str(df['date'].iloc[0].date()) if hasattr(df['date'].iloc[0], 'date') else str(df['date'].iloc[0])[:10],
-            'vix'        : vix_val,
-            'vix_pct'    : vix_pct,
-            'regime'     : regime,
-            'proba'      : safe_float(proba * 100, 1),
-            'exposition' : safe_float(expo * 100),
-            'signal'     : signal,
-            'couleur'    : couleur,
-            'score'      : safe_float(score, 1),
-            'conviction' : conviction,
-            'modele_ok'  : True,
-        }
+        return {'vix': vix_val, 'regime': regime,
+                'proba': f(proba*100,1), 'expo': expo,
+                'signal': sig, 'couleur': col,
+                'score': f(score,1), 'conviction': conv,
+                'ok': True, 'date': date}
 
     except FileNotFoundError:
-        return default_signal()
+        return {**DEFAULT, 'ok': False}
     except Exception as e:
-        print(f"  Erreur signal ML : {e}")
-        return default_signal()
-
-
-def default_signal():
-    return {
-        'date': datetime.now().strftime('%Y-%m-%d'),
-        'vix': 0.0, 'vix_pct': 50.0, 'regime': 'calme',
-        'proba': 50.0, 'exposition': 60.0,
-        'signal': 'N/A', 'couleur': 'gray',
-        'score': 0.0, 'conviction': 'FAIBLE', 'modele_ok': False,
-    }
+        print(f"Erreur ML: {e}")
+        return {**DEFAULT, 'ok': False}
 
 
 # ─────────────────────────────────────────────────────────────
-# TENDANCE TECHNIQUE
+# 3. TENDANCE TECHNIQUE
 # ─────────────────────────────────────────────────────────────
 
-def get_tendance():
+def tendance():
     try:
-        conn = get_conn()
-        sp   = pd.read_sql(
-            "SELECT date, close, high, low, open, volume FROM sp500_prices ORDER BY date DESC LIMIT 300",
-            conn
-        ).iloc[::-1].reset_index(drop=True)
+        conn = db()
+        sp   = pd.read_sql("SELECT close,high,low,open,volume FROM sp500_prices ORDER BY date DESC LIMIT 250",
+                           conn).iloc[::-1].reset_index(drop=True)
         conn.close()
 
-        close = sp['close']
-        ma20  = safe_float(close.rolling(20).mean().iloc[-1])
-        ma50  = safe_float(close.rolling(50).mean().iloc[-1])
-        ma200 = safe_float(close.rolling(200).mean().iloc[-1])
-        prix  = safe_float(close.iloc[-1])
+        c = sp['close']
+        ma20  = f(c.rolling(20).mean().iloc[-1])
+        ma50  = f(c.rolling(50).mean().iloc[-1])
+        ma200 = f(c.rolling(200).mean().iloc[-1])
+        prix  = f(c.iloc[-1])
 
-        delta = close.diff()
-        gain  = delta.clip(lower=0).rolling(14).mean()
-        loss  = (-delta.clip(upper=0)).rolling(14).mean()
-        rsi   = safe_float(100 - (100 / (1 + gain / loss)).iloc[-1])
+        delta = c.diff()
+        rsi   = f(100 - (100 / (1 + delta.clip(lower=0).rolling(14).mean() /
+                                   (-delta.clip(upper=0)).rolling(14).mean())).iloc[-1])
 
-        ema12 = close.ewm(span=12).mean()
-        ema26 = close.ewm(span=26).mean()
-        macd  = ema12 - ema26
-        macd_sig = macd.ewm(span=9).mean()
-        macd_hist = safe_float((macd - macd_sig).iloc[-1])
+        ema12 = c.ewm(span=12).mean()
+        ema26 = c.ewm(span=26).mean()
+        macd_hist = f((ema12 - ema26 - (ema12-ema26).ewm(span=9).mean()).iloc[-1], 4)
+        bb_z      = f(((c - c.rolling(20).mean()) / c.rolling(20).std()).iloc[-1], 2)
+        mom5      = f((c.iloc[-1]/c.iloc[-6]-1)*100, 2)
 
-        bb_std = close.rolling(20).std()
-        bb_z   = safe_float((close - close.rolling(20).mean()).iloc[-1] /
-                             bb_std.iloc[-1])
+        def sc(v, seuils):  # score discret
+            for seuil, pts in seuils:
+                if v >= seuil: return pts
+            return seuils[-1][1]
 
-        mom5  = safe_float((close.iloc[-1] / close.iloc[-6] - 1) * 100, 2)
+        s_rsi  = sc(rsi,  [(60,20),(50,10),(40,-10),(0,-20)])
+        s_macd = 20 if macd_hist > 0 else -20
+        s_mom5 = sc(mom5, [(2,20),(0,10),(-2,-10),(-99,-20)])
+        s_vix  = 0  # calculé dans signal_ml
 
-        # Scores
-        def score_rsi(r):
-            if r > 60: return 20
-            elif r > 50: return 10
-            elif r < 40: return -20
-            else: return -10
+        s_ma20  = sc((prix/ma20-1)*100,  [(3,20),(0,10),(-3,-10),(-99,-20)])
+        s_ma50  = sc((prix/ma50-1)*100,  [(5,20),(0,10),(-5,-10),(-99,-20)])
+        s_cross = 20 if ma20 > ma50 else -20
+        s_bb    = sc(bb_z, [(1.5,20),(0.5,10),(-0.5,-10),(-99,-20)])
 
-        def score_prix_ma(p, ma):
-            ecart = (p - ma) / ma * 100
-            if ecart > 3: return 20
-            elif ecart > 0: return 10
-            elif ecart < -3: return -20
-            else: return -10
+        s_ma200 = sc((prix/ma200-1)*100, [(5,30),(0,15),(-5,-15),(-99,-30)])
+        s_lt_c  = 15 if ma50 > ma200 else -15
+        s_lt_m  = sc(mom5, [(2,20),(0,10),(-99,-10)])
 
-        s_ct = score_rsi(rsi) + (20 if macd_hist > 0 else -20) + (10 if mom5 > 0 else -10)
-        s_mt = score_prix_ma(prix, ma20) + score_prix_ma(prix, ma50) + (20 if ma20 > ma50 else -20)
-        s_lt = score_prix_ma(prix, ma200) + (15 if ma50 > ma200 else -15) + (20 if prix > ma200 else -20)
+        s_ct = s_rsi + s_macd + s_mom5
+        s_mt = s_ma20 + s_ma50 + s_cross + s_bb
+        s_lt = s_ma200 + s_lt_c + s_lt_m
 
-        max_s = 60
-        s_ct_n = round(s_ct / max_s * 100, 1)
-        s_mt_n = round(s_mt / max_s * 100, 1)
-        s_lt_n = round(s_lt / max_s * 100, 1)
-
-        resistance = safe_float(close.rolling(20).max().iloc[-1] * 1.02)
-        support_1  = safe_float(ma50 * 0.97)
-        support_2  = safe_float(ma200 * 0.98)
+        norm = lambda s, mx: round(s/mx*100, 1)
 
         return {
-            'ma20'       : ma20,
-            'ma50'       : ma50,
-            'ma200'      : ma200,
-            'rsi'        : rsi,
-            'macd_hist'  : macd_hist,
-            'bb_zscore'  : bb_z,
-            'mom5'       : mom5,
-            'score_ct'   : s_ct_n,
-            'score_mt'   : s_mt_n,
-            'score_lt'   : s_lt_n,
-            'ecart_ma20' : safe_float((prix / ma20 - 1) * 100, 2),
-            'ecart_ma50' : safe_float((prix / ma50 - 1) * 100, 2),
-            'ecart_ma200': safe_float((prix / ma200 - 1) * 100, 2),
-            'resistance' : resistance,
-            'support_1'  : support_1,
-            'support_2'  : support_2,
+            'ma20': ma20, 'ma50': ma50, 'ma200': ma200,
+            'rsi': rsi, 'macd_hist': macd_hist, 'bb_z': bb_z, 'mom5': mom5,
+            'score_ct': norm(s_ct, 60), 'score_mt': norm(s_mt, 80), 'score_lt': norm(s_lt, 60),
+            'ecart20':  f((prix/ma20-1)*100,2),
+            'ecart50':  f((prix/ma50-1)*100,2),
+            'ecart200': f((prix/ma200-1)*100,2),
+            'resistance': f(c.rolling(20).max().iloc[-1]*1.02),
+            'support1':   f(ma50*0.97),
+            'support2':   f(ma200*0.98),
         }
     except Exception as e:
-        print(f"  Erreur tendance : {e}")
+        print(f"Erreur tendance: {e}")
         return {}
 
 
 # ─────────────────────────────────────────────────────────────
-# HISTORIQUE DES PERFORMANCES (depuis les CSV résultats)
+# 4. PERFORMANCE — lit les CSV et détecte les colonnes auto
 # ─────────────────────────────────────────────────────────────
 
-def get_perf_history():
-    result = {'calme': [], 'stress': []}
+def perf():
+    out = {}
     for regime in ['calme', 'stress']:
         path = f"results/comparaison_{regime}.csv"
         if not os.path.exists(path):
+            out[regime] = {}
             continue
         try:
             df = pd.read_csv(path)
-            # Cumuls sous forme de liste pour le graphe
-            for col in ['cumul_strat', 'cumul_bh', 'cumul_bin']:
-                if col in df.columns:
-                    df[col] = df[col].fillna(method='ffill')
+            print(f"  [perf] {regime} colonnes: {df.columns.tolist()}")
 
-            dates   = df['date'].tolist() if 'date' in df.columns else list(range(len(df)))
-            # Prendre 1 point tous les 5 jours pour alléger
-            step    = max(1, len(df) // 50)
-            indices = list(range(0, len(df), step))
+            # Détecter colonnes dates
+            date_col = next((c for c in df.columns
+                             if 'date' in c.lower()), None)
 
-            result[regime] = {
-                'dates'      : [str(dates[i])[:10] for i in indices],
-                'ml'         : [safe_float(df['cumul_strat'].iloc[i] * 100 - 100) for i in indices],
-                'bh'         : [safe_float(df['cumul_bh'].iloc[i]    * 100 - 100) for i in indices],
-                'bin'        : [safe_float(df['cumul_bin'].iloc[i]    * 100 - 100) for i in indices] if 'cumul_bin' in df.columns else [],
+            # Détecter colonnes cumul (plusieurs noms possibles)
+            def find_col(keywords):
+                for kw in keywords:
+                    for c in df.columns:
+                        if kw in c.lower():
+                            return c
+                return None
+
+            col_ml  = find_col(['cumul_strat','cumul_dyn','strat','dyn'])
+            col_bh  = find_col(['cumul_bh','bh'])
+            col_bin = find_col(['cumul_bin','bin'])
+
+            # Si cumul absent, recalculer depuis ret
+            if col_ml is None:
+                ret_col = find_col(['ret_strat','ret_dyn','ret_strategie'])
+                if ret_col:
+                    df['_cumul_ml'] = (1 + df[ret_col]).cumprod()
+                    col_ml = '_cumul_ml'
+
+            if col_bh is None:
+                ret_bh = find_col(['ret_bh','ret_j1'])
+                if ret_bh:
+                    df['_cumul_bh'] = (1 + df[ret_bh]).cumprod()
+                    col_bh = '_cumul_bh'
+
+            if col_ml is None or col_bh is None:
+                print(f"  [perf] colonnes ML/BH introuvables pour {regime}")
+                out[regime] = {}
+                continue
+
+            df = df.dropna(subset=[col_ml, col_bh]).reset_index(drop=True)
+            if len(df) == 0:
+                out[regime] = {}
+                continue
+
+            # Convertir en % relatif à la première valeur
+            def to_pct(col):
+                s = df[col].values.astype(float)
+                return ((s / s[0]) * 100 - 100).tolist()
+
+            step = max(1, len(df) // 60)
+            idx  = list(range(0, len(df), step))
+
+            out[regime] = {
+                'dates': [str(df[date_col].iloc[i])[:10] for i in idx] if date_col else [str(i) for i in idx],
+                'ml':    [round(to_pct(col_ml)[i],  1) for i in idx],
+                'bh':    [round(to_pct(col_bh)[i],  1) for i in idx],
+                'bin':   [round(to_pct(col_bin)[i], 1) for i in idx] if col_bin else [],
             }
         except Exception as e:
-            print(f"  Erreur perf {regime} : {e}")
-    return result
+            print(f"  [perf] Erreur {regime}: {e}")
+            out[regime] = {}
+    return out
 
 
 # ─────────────────────────────────────────────────────────────
-# HISTORIQUE DES TENDANCES
+# 5. HISTORIQUE TENDANCES
 # ─────────────────────────────────────────────────────────────
 
-def get_tendance_history():
+def historique():
     path = "results/historique_tendances.csv"
     if not os.path.exists(path):
         return []
     try:
-        df = pd.read_csv(path).tail(30)
-        return df.to_dict(orient='records')
-    except Exception:
+        return pd.read_csv(path).tail(30).to_dict(orient='records')
+    except:
         return []
 
 
 # ─────────────────────────────────────────────────────────────
-# API ENDPOINTS
+# API
 # ─────────────────────────────────────────────────────────────
 
 @app.route('/api/data')
 def api_data():
-    marche  = get_market_data()
-    signal  = get_ml_signal()
-    tendance = get_tendance()
-    perf    = get_perf_history()
-    hist    = get_tendance_history()
-
     return jsonify({
-        'timestamp': datetime.now().strftime('%d/%m/%Y %H:%M:%S'),
-        'marche'   : marche,
-        'signal'   : signal,
-        'tendance' : tendance,
-        'perf'     : perf,
-        'historique': hist,
+        'ts'         : datetime.now().strftime('%d/%m/%Y %H:%M:%S'),
+        'marche'     : marche(),
+        'signal'     : signal_ml(),
+        'tendance'   : tendance(),
+        'perf'       : perf(),
+        'historique' : historique(),
     })
-
 
 @app.route('/api/signal')
 def api_signal():
-    return jsonify(get_ml_signal())
+    return jsonify(signal_ml())
 
 
 # ─────────────────────────────────────────────────────────────
-# PAGE HTML DU DASHBOARD
+# HTML
 # ─────────────────────────────────────────────────────────────
 
-HTML = """<!DOCTYPE html>
+PAGE = r"""<!DOCTYPE html>
 <html lang="fr">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>S&P 500 ML Predictor — Live</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>S&P 500 ML Predictor</title>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
-  --bg:#080c14;--bg2:#0d1320;--bg3:#111b2e;--bg4:#162035;
-  --bd:#1e2d45;--bd2:#253650;
-  --t:#e2e8f0;--t2:#94a3b8;--t3:#4a5568;
-  --green:#22c55e;--green2:#3b6d11;
-  --red:#ef4444;--red2:#a32d2d;
-  --blue:#3b82f6;--blue2:#185fa5;
-  --amber:#f97316;--amber2:#854f0b;
-  --yellow:#eab308;
-  --mono:'IBM Plex Mono',monospace;
+  --bg:#07090f;--s1:#0d1117;--s2:#161b22;--s3:#21262d;
+  --bd:#30363d;--bd2:#3d444d;
+  --t:#f0f6fc;--t2:#8b949e;--t3:#484f58;
+  --g:#3fb950;--g2:#1a7f37;
+  --r:#f85149;--r2:#b91c1c;
+  --b:#58a6ff;--b2:#1d6fd8;
+  --a:#d29922;--a2:#9e6a03;
+  --p:#bc8cff;
+  --mono:'JetBrains Mono',monospace;
+  --sans:'Space Grotesk',sans-serif;
 }
-html,body{background:var(--bg);color:var(--t);font-family:var(--mono);font-size:13px;min-height:100vh}
-.wrap{max-width:1440px;margin:0 auto;padding:0 24px 48px}
-/* TOPBAR */
-.topbar{display:flex;align-items:center;justify-content:space-between;padding:16px 0;border-bottom:0.5px solid var(--bd);margin-bottom:18px}
-.logo-title{font-size:15px;font-weight:500;letter-spacing:.03em}
-.logo-sub{font-size:10px;color:var(--t3);letter-spacing:.08em;text-transform:uppercase;margin-top:2px}
-.live-row{display:flex;align-items:center;gap:10px}
-.live-dot{width:7px;height:7px;border-radius:50%;background:var(--green);animation:blink 1.4s infinite}
-@keyframes blink{0%,100%{opacity:1}50%{opacity:.2}}
-.badge-pill{font-size:10px;background:var(--bg3);border:0.5px solid var(--bd);padding:4px 12px;border-radius:5px;color:var(--t2)}
+html,body{background:var(--bg);color:var(--t);font-family:var(--sans);min-height:100vh;font-size:14px;line-height:1.5}
+.wrap{max-width:1480px;margin:0 auto;padding:0 20px 60px}
+
+/* TOP */
+.topbar{display:flex;align-items:center;justify-content:space-between;padding:16px 0;border-bottom:1px solid var(--bd);margin-bottom:20px}
+.brand{display:flex;align-items:center;gap:10px}
+.brand-icon{width:34px;height:34px;background:linear-gradient(135deg,var(--b2),var(--b));border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:18px}
+.brand-name{font-size:15px;font-weight:600;letter-spacing:-.01em}
+.brand-sub{font-size:10px;color:var(--t3);letter-spacing:.08em;text-transform:uppercase}
+.top-right{display:flex;align-items:center;gap:8px}
+.pill{font-size:11px;font-family:var(--mono);background:var(--s2);border:1px solid var(--bd);padding:4px 12px;border-radius:20px;color:var(--t2)}
+.live-dot{width:7px;height:7px;border-radius:50%;background:var(--g);animation:pulse 1.8s infinite}
+@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.3;transform:scale(.7)}}
+
 /* GRIDS */
-.g4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:11px;margin-bottom:14px}
-.g3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:11px;margin-bottom:14px}
-.g2{display:grid;grid-template-columns:1fr 1fr;gap:11px;margin-bottom:14px}
-.g21{display:grid;grid-template-columns:2fr 1fr;gap:11px;margin-bottom:14px}
-.g32{display:grid;grid-template-columns:3fr 2fr;gap:11px;margin-bottom:14px}
-/* METRIC */
-.mc{background:var(--bg3);border-radius:8px;padding:13px 15px}
-.ml{font-size:9px;color:var(--t3);letter-spacing:.1em;text-transform:uppercase;margin-bottom:5px}
-.mv{font-size:24px;font-weight:500;line-height:1}
-.ms{font-size:10px;color:var(--t2);margin-top:4px;display:flex;align-items:center;gap:5px}
+.g4{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:16px}
+.g3{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:16px}
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px}
+.g21{display:grid;grid-template-columns:2fr 1fr;gap:12px;margin-bottom:16px}
+.g31{display:grid;grid-template-columns:3fr 1.4fr;gap:12px;margin-bottom:16px}
+
+/* STAT CARD */
+.sc{background:var(--s1);border:1px solid var(--bd);border-radius:10px;padding:14px 16px;position:relative;overflow:hidden}
+.sc::after{content:'';position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,rgba(88,166,255,.2),transparent)}
+.sc-label{font-size:10px;color:var(--t3);letter-spacing:.1em;text-transform:uppercase;font-family:var(--mono);margin-bottom:6px}
+.sc-val{font-size:26px;font-weight:600;line-height:1;margin-bottom:4px;font-family:var(--mono)}
+.sc-sub{font-size:11px;color:var(--t2);display:flex;align-items:center;gap:6px}
+
 /* CARD */
-.card{background:var(--bg2);border:0.5px solid var(--bd);border-radius:10px;padding:15px 18px}
-.ct{font-size:9px;color:var(--t3);letter-spacing:.1em;text-transform:uppercase;margin-bottom:12px}
+.card{background:var(--s1);border:1px solid var(--bd);border-radius:10px;padding:16px 18px}
+.card-h{font-size:10px;font-family:var(--mono);color:var(--t3);letter-spacing:.1em;text-transform:uppercase;margin-bottom:14px;display:flex;align-items:center;justify-content:space-between}
+.card-h span{font-size:10px;background:var(--s2);padding:2px 8px;border-radius:4px;border:1px solid var(--bd);color:var(--t2)}
+
 /* COLORS */
-.green{color:var(--green)}.red{color:var(--red)}.blue{color:var(--blue)}.amber{color:var(--amber)}.yellow{color:var(--yellow)}
+.g{color:var(--g)}.r{color:var(--r)}.b{color:var(--b)}.a{color:var(--a)}.p{color:var(--p)}
+
 /* SIGNAL */
-.sig-hero{text-align:center;padding:18px 8px}
-.sig-tag{display:inline-flex;align-items:center;gap:7px;font-size:18px;font-weight:500;padding:9px 22px;border-radius:7px;margin-bottom:8px;border:1px solid}
-.sig-green{background:rgba(34,197,94,.1);color:var(--green);border-color:rgba(34,197,94,.25)}
-.sig-red  {background:rgba(239,68,68,.1);color:var(--red)  ;border-color:rgba(239,68,68,.25)}
-.sig-amber{background:rgba(249,115,22,.1);color:var(--amber);border-color:rgba(249,115,22,.25)}
-.sig-gray {background:rgba(148,163,184,.08);color:var(--t2);border-color:var(--bd2)}
-/* PBAR */
-.pbar{width:100%;height:5px;background:var(--bg4);border-radius:3px;overflow:hidden;margin:8px 0 4px}
-.pfill{height:100%;border-radius:3px;transition:width 1s ease}
-/* ROWS */
-.row{display:flex;align-items:center;gap:9px;margin-bottom:8px}
-.rl{font-size:10px;color:var(--t2);min-width:90px}
-.rb{flex:1;height:5px;background:var(--bg4);border-radius:3px;overflow:hidden}
-.rf{height:100%;border-radius:3px}
-.rv{font-size:11px;font-weight:500;min-width:36px;text-align:right}
-/* ASSET */
-.arow{display:flex;align-items:center;gap:8px;padding:7px 0;border-bottom:0.5px solid var(--bd)}
+.sig-center{display:flex;flex-direction:column;align-items:center;padding:20px 0 14px;gap:8px}
+.sig-tag{font-size:20px;font-weight:600;font-family:var(--mono);padding:10px 28px;border-radius:8px;letter-spacing:.02em;border:1px solid}
+.sg{background:rgba(63,185,80,.1);color:var(--g);border-color:rgba(63,185,80,.3)}
+.sr{background:rgba(248,81,73,.1);color:var(--r);border-color:rgba(248,81,73,.3)}
+.sa{background:rgba(210,153,34,.1);color:var(--a);border-color:rgba(210,153,34,.3)}
+.sx{background:var(--s2);color:var(--t2);border-color:var(--bd)}
+.sig-meta{font-size:11px;font-family:var(--mono);color:var(--t3);text-align:center}
+.pbar{width:100%;height:4px;background:var(--s3);border-radius:2px;overflow:hidden;margin:6px 0 3px}
+.pf{height:100%;border-radius:2px;transition:width 1s ease}
+.pbar-labels{display:flex;justify-content:space-between;font-size:9px;font-family:var(--mono);color:var(--t3)}
+
+/* HORIZON BARS */
+.hrow{display:flex;align-items:center;gap:10px;margin-bottom:9px}
+.hlbl{font-size:10px;font-family:var(--mono);color:var(--t2);min-width:100px}
+.hbar{flex:1;height:5px;background:var(--s3);border-radius:3px;overflow:hidden;position:relative}
+.hfill{position:absolute;top:0;height:100%;border-radius:3px;transition:all .8s ease}
+.hval{font-size:11px;font-family:var(--mono);font-weight:500;min-width:38px;text-align:right}
+
+/* TABLE ASSETS */
+.arow{display:flex;align-items:center;gap:8px;padding:7px 0;border-bottom:1px solid var(--bd)}
 .arow:last-child{border-bottom:none}
-.ati{font-size:11px;font-weight:500;min-width:52px}
+.atic{font-size:11px;font-weight:600;font-family:var(--mono);min-width:56px}
 .an{font-size:10px;color:var(--t3);flex:1}
-.ap{font-size:11px;min-width:70px;text-align:right}
-.ac{font-size:11px;font-weight:500;min-width:52px;text-align:right}
-.abadge{font-size:9px;padding:2px 7px;border-radius:4px;min-width:42px;text-align:center}
-.bg{background:rgba(34,197,94,.1);color:var(--green)}
-.br{background:rgba(239,68,68,.1);color:var(--red)}
-.bx{background:rgba(148,163,184,.08);color:var(--t2)}
-/* SEP */
-.sep{border:none;border-top:0.5px solid var(--bd);margin:.8rem 0}
-/* INDICATOR TABLE */
-.indic{display:flex;flex-direction:column;gap:7px}
-.irow{display:flex;justify-content:space-between;align-items:center;font-size:11px}
-.ikey{color:var(--t2)}
-.ival{font-weight:500}
-/* REGIME */
-.rcal{border-left:3px solid var(--green) }
-.rstress{border-left:3px solid var(--amber)}
-.rcrash{border-left:3px solid var(--red)  }
-.rblock{background:var(--bg3);border-radius:6px;padding:10px 12px;margin-bottom:8px}
-/* STATUS */
-.status-bar{display:flex;align-items:center;gap:8px;background:var(--bg3);padding:8px 14px;border-radius:6px;font-size:10px;color:var(--t3)}
-/* REFRESH BTN */
-.refresh-btn{font-size:11px;padding:5px 14px;background:transparent;border:0.5px solid var(--bd2);border-radius:5px;color:var(--t2);cursor:pointer;transition:all .15s;font-family:var(--mono)}
-.refresh-btn:hover{background:var(--bg3);color:var(--t)}
-/* SCROLLBAR */
+.ap{font-size:11px;font-family:var(--mono);min-width:74px;text-align:right}
+.av{font-size:11px;font-family:var(--mono);font-weight:600;min-width:54px;text-align:right}
+.abadge{font-size:9px;font-family:var(--mono);padding:2px 7px;border-radius:3px;min-width:40px;text-align:center;border:1px solid}
+.bag{background:rgba(63,185,80,.1);color:var(--g);border-color:rgba(63,185,80,.25)}
+.bar{background:rgba(248,81,73,.1);color:var(--r);border-color:rgba(248,81,73,.25)}
+.bax{background:var(--s2);color:var(--t3);border-color:var(--bd)}
+
+/* INDIC TABLE */
+.irow{display:flex;justify-content:space-between;align-items:center;padding:5px 0;border-bottom:1px solid var(--bd)}
+.irow:last-child{border-bottom:none}
+.ik{font-size:11px;color:var(--t2)}
+.iv{font-size:11px;font-family:var(--mono);font-weight:500}
+
+/* REGIME BLOCKS */
+.rblock{border-radius:8px;padding:10px 12px;margin-bottom:8px;border-left:3px solid}
+.rcalme{background:rgba(63,185,80,.06);border-left-color:var(--g)}
+.rstress{background:rgba(210,153,34,.06);border-left-color:var(--a)}
+.rcrash{background:rgba(248,81,73,.06);border-left-color:var(--r)}
+.rcalme2{background:rgba(88,166,255,.06);border-left-color:var(--b)}
+.rblock-title{font-size:11px;font-weight:600;font-family:var(--mono);margin-bottom:3px}
+.rblock-sub{font-size:10px;color:var(--t2)}
+
+/* FEAT BARS */
+.frow{display:flex;align-items:center;gap:8px;margin-bottom:7px}
+.frk{font-size:9px;font-family:var(--mono);color:var(--t3);min-width:14px}
+.fn{font-size:10px;color:var(--t2);flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.fb{flex:0 0 88px;height:4px;background:var(--s3);border-radius:2px;overflow:hidden}
+.ff{height:100%;border-radius:2px}
+.fp{font-size:9px;font-family:var(--mono);color:var(--t3);min-width:30px;text-align:right}
+
+/* HIST TABLE */
+.htable{width:100%;border-collapse:collapse;font-size:11px}
+.htable th{padding:6px 10px;text-align:left;color:var(--t3);border-bottom:1px solid var(--bd);font-weight:500;font-family:var(--mono);font-size:9px;text-transform:uppercase;letter-spacing:.06em}
+.htable td{padding:6px 10px;border-bottom:1px solid var(--bd);font-family:var(--mono)}
+.htable tr:last-child td{border-bottom:none}
+.htable tr:hover td{background:var(--s2)}
+
+/* TABS */
+.tabs{display:flex;gap:6px;margin-bottom:12px}
+.tab{font-size:10px;font-family:var(--mono);padding:4px 12px;background:transparent;border:1px solid var(--bd);border-radius:4px;color:var(--t2);cursor:pointer;transition:.15s}
+.tab.on{background:var(--s2);color:var(--t);border-color:var(--bd2)}
+
+.sep{border:none;border-top:1px solid var(--bd);margin:.9rem 0}
+.muted{color:var(--t3)}
 ::-webkit-scrollbar{width:4px}::-webkit-scrollbar-track{background:var(--bg)}::-webkit-scrollbar-thumb{background:var(--bd2);border-radius:2px}
 </style>
 </head>
 <body>
 <div class="wrap">
 
-  <div class="topbar">
+<!-- TOPBAR -->
+<div class="topbar">
+  <div class="brand">
+    <div class="brand-icon">📈</div>
     <div>
-      <div class="logo-title">&#x1F4C8; S&P 500 ML Predictor</div>
-      <div class="logo-sub">Intelligent Trading System · Dual-Regime Ensemble</div>
-    </div>
-    <div class="live-row">
-      <span class="live-dot"></span>
-      <span style="font-size:10px;color:var(--t2)">LIVE</span>
-      <span class="badge-pill" id="clock">--:--:--</span>
-      <span class="badge-pill" id="last-update">Chargement...</span>
-      <button class="refresh-btn" onclick="loadData()">&#x21BB; Actualiser</button>
+      <div class="brand-name">S&P 500 ML Predictor</div>
+      <div class="brand-sub">Intelligent Trading System · Dual-Regime Ensemble</div>
     </div>
   </div>
-
-  <div class="status-bar" id="status-bar">
-    <span>&#9679;</span>
-    <span id="status-text">Connexion à SQLite...</span>
+  <div class="top-right">
+    <span class="live-dot"></span>
+    <span class="pill" id="clock">--:--:--</span>
+    <span class="pill" id="ts">---</span>
+    <button onclick="load()" style="font-size:11px;font-family:var(--mono);background:var(--s2);border:1px solid var(--bd);padding:5px 14px;border-radius:20px;color:var(--t2);cursor:pointer">↻ Refresh</button>
   </div>
-  <div style="height:14px"></div>
-
-  <!-- MÉTRIQUES -->
-  <div class="g4">
-    <div class="mc">
-      <div class="ml">S&P 500</div>
-      <div class="mv green" id="sp-prix">---</div>
-      <div class="ms" id="sp-var">---</div>
-    </div>
-    <div class="mc">
-      <div class="ml">VIX</div>
-      <div class="mv" id="vix-val" style="color:var(--blue)">---</div>
-      <div class="ms" id="vix-regime">---</div>
-    </div>
-    <div class="mc">
-      <div class="ml">P(hausse 5j)</div>
-      <div class="mv" id="proba-val">---</div>
-      <div class="ms" id="proba-sub">RF · XGB · LR ensemble</div>
-    </div>
-    <div class="mc">
-      <div class="ml">Exposition cible</div>
-      <div class="mv" id="expo-val">---</div>
-      <div class="ms" id="expo-sub">allocation dynamique</div>
-    </div>
-  </div>
-
-  <!-- SIGNAL + TENDANCE + ASSETS -->
-  <div class="g21">
-
-    <div class="card">
-      <div class="ct">Signal de trading</div>
-      <div class="sig-hero">
-        <div class="sig-tag sig-gray" id="signal-badge">--- SIGNAL ---</div>
-        <div style="font-size:10px;color:var(--t3)" id="signal-meta">Chargement du modèle...</div>
-        <div class="pbar"><div class="pfill" id="proba-fill" style="width:50%;background:var(--t3)"></div></div>
-        <div style="display:flex;justify-content:space-between;font-size:9px;color:var(--t3)">
-          <span>VENTE &larr;</span><span>&rarr; ACHAT</span>
-        </div>
-      </div>
-      <div class="sep"></div>
-      <div class="ct">Tendance multi-horizons</div>
-      <div class="row"><div class="rl">Court terme 5j</div><div class="rb"><div class="rf" id="bar-ct" style="width:0%;background:var(--green)"></div></div><div class="rv" id="val-ct">---</div></div>
-      <div class="row"><div class="rl">Moyen terme 20j</div><div class="rb"><div class="rf" id="bar-mt" style="width:0%;background:var(--green)"></div></div><div class="rv" id="val-mt">---</div></div>
-      <div class="row"><div class="rl">Long terme 60j</div><div class="rb"><div class="rf" id="bar-lt" style="width:0%;background:var(--green)"></div></div><div class="rv" id="val-lt">---</div></div>
-      <div class="row"><div class="rl">Modèle ML</div><div class="rb"><div class="rf" id="bar-ml" style="width:0%;background:var(--blue)"></div></div><div class="rv" id="val-ml">---</div></div>
-      <div class="sep"></div>
-      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px">
-        <div style="font-size:11px"><span style="color:var(--t3)">MA20</span><br><span id="ma20">---</span></div>
-        <div style="font-size:11px"><span style="color:var(--t3)">MA50</span><br><span id="ma50">---</span></div>
-        <div style="font-size:11px"><span style="color:var(--t3)">MA200</span><br><span id="ma200">---</span></div>
-        <div style="font-size:11px"><span style="color:var(--t3)">Support</span><br><span style="color:var(--amber)" id="support">---</span></div>
-        <div style="font-size:11px"><span style="color:var(--t3)">Résistance</span><br><span style="color:var(--yellow)" id="resistance">---</span></div>
-        <div style="font-size:11px"><span style="color:var(--t3)">RSI 14</span><br><span id="rsi-val">---</span></div>
-      </div>
-    </div>
-
-    <div style="display:flex;flex-direction:column;gap:11px">
-      <div class="card">
-        <div class="ct">Multi-actifs</div>
-        <div id="assets-box">
-          <div style="font-size:10px;color:var(--t3)">Chargement...</div>
-        </div>
-      </div>
-      <div class="card">
-        <div class="ct">Indicateurs techniques</div>
-        <div class="indic" id="indic-box">
-          <div class="irow"><div class="ikey">MACD hist.</div><div class="ival" id="macd-val">---</div></div>
-          <div class="irow"><div class="ikey">Bollinger Z</div><div class="ival" id="bb-val">---</div></div>
-          <div class="irow"><div class="ikey">Momentum 5j</div><div class="ival" id="mom-val">---</div></div>
-          <div class="irow"><div class="ikey">Écart MA20</div><div class="ival" id="ema20-val">---</div></div>
-          <div class="irow"><div class="ikey">Écart MA50</div><div class="ival" id="ema50-val">---</div></div>
-          <div class="irow"><div class="ikey">Écart MA200</div><div class="ival" id="ema200-val">---</div></div>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <!-- CHART PERFORMANCE -->
-  <div class="g2">
-    <div class="card">
-      <div class="ct">Performance cumulée — Régime CALME</div>
-      <div style="display:flex;gap:14px;margin-bottom:10px" id="legend-calme"></div>
-      <div style="position:relative;height:190px"><canvas id="chartCalme" role="img" aria-label="Performance cumulée régime calme">Courbe de performance ML vs Buy and Hold en régime calme.</canvas></div>
-    </div>
-    <div class="card">
-      <div class="ct">Performance cumulée — Régime STRESS</div>
-      <div style="display:flex;gap:14px;margin-bottom:10px" id="legend-stress"></div>
-      <div style="position:relative;height:190px"><canvas id="chartStress" role="img" aria-label="Performance cumulée régime stress">Courbe de performance ML vs Buy and Hold en régime stress.</canvas></div>
-    </div>
-  </div>
-
-  <!-- RÉGIMES + HISTORIQUE -->
-  <div class="g32">
-    <div class="card">
-      <div class="ct">Historique des signaux de tendance (30 derniers jours)</div>
-      <div id="hist-box" style="overflow-x:auto">
-        <div style="font-size:10px;color:var(--t3)">Chargement...</div>
-      </div>
-    </div>
-    <div class="card">
-      <div class="ct">Analyse par régime VIX</div>
-      <div class="rblock rcal">
-        <div style="font-size:11px;font-weight:500;color:var(--green);margin-bottom:4px">Très calme — VIX &lt; 15</div>
-        <div style="font-size:10px;color:var(--t2)">Hit Rate <b>61.1%</b> · Sharpe <b>5.07</b> · 1062 j.</div>
-      </div>
-      <div class="rblock rcal" style="border-left-color:var(--blue)">
-        <div style="font-size:11px;font-weight:500;color:var(--blue);margin-bottom:4px">Calme — VIX 15-20</div>
-        <div style="font-size:10px;color:var(--t2)">Hit Rate <b>55.0%</b> · Sharpe <b>2.29</b> · 962 j.</div>
-      </div>
-      <div class="rblock rstress">
-        <div style="font-size:11px;font-weight:500;color:var(--amber);margin-bottom:4px">Volatil — VIX 20-30</div>
-        <div style="font-size:10px;color:var(--t2)">Hit Rate <b>46.4%</b> · Sharpe <b>-0.96</b> · 705 j.</div>
-      </div>
-      <div class="rblock rcrash">
-        <div style="font-size:11px;font-weight:500;color:var(--red);margin-bottom:4px">Extrême — VIX &gt; 30</div>
-        <div style="font-size:10px;color:var(--t2)">Hit Rate <b>37.3%</b> · Sharpe <b>-2.62</b> · 158 j.</div>
-      </div>
-      <div class="sep"></div>
-      <div style="font-size:10px;color:var(--t3)">Corrélation SP500/VIX : <span style="color:var(--red);font-weight:500">-0.727</span></div>
-    </div>
-  </div>
-
-  <div style="border-top:0.5px solid var(--bd);padding-top:12px;display:flex;justify-content:space-between">
-    <div style="font-size:9px;color:var(--t3)">S&P 500 ML Predictor · RF + XGBoost + LR · Walk-forward validation · Zero data leakage</div>
-    <div style="font-size:9px;color:var(--t3)">Actualisation auto toutes les 60s · <span id="next-refresh">60</span>s</div>
-  </div>
-
 </div>
 
+<!-- KPI -->
+<div class="g4">
+  <div class="sc"><div class="sc-label">S&P 500</div><div class="sc-val g" id="k-sp">---</div><div class="sc-sub" id="k-spv">---</div></div>
+  <div class="sc"><div class="sc-label">VIX</div><div class="sc-val b" id="k-vix">---</div><div class="sc-sub" id="k-reg">---</div></div>
+  <div class="sc"><div class="sc-label">P(hausse 5j)</div><div class="sc-val" id="k-prob">---</div><div class="sc-sub muted">RF · XGB · LR</div></div>
+  <div class="sc"><div class="sc-label">Exposition</div><div class="sc-val" id="k-expo">---</div><div class="sc-sub" id="k-sig">---</div></div>
+</div>
+
+<!-- ROW 2 : SIGNAL + ASSETS + INDICATEURS -->
+<div class="g3">
+
+  <!-- Signal -->
+  <div class="card">
+    <div class="card-h">Signal de trading <span id="sig-date">---</span></div>
+    <div class="sig-center">
+      <div class="sig-tag sx" id="sig-tag">— SIGNAL —</div>
+      <div class="sig-meta" id="sig-meta">Chargement du modèle...</div>
+    </div>
+    <div class="pbar"><div class="pf" id="pf" style="width:50%;background:var(--t3)"></div></div>
+    <div class="pbar-labels"><span>← VENTE</span><span>ACHAT →</span></div>
+    <div class="sep"></div>
+    <div class="card-h">Tendance multi-horizons</div>
+    <div class="hrow"><div class="hlbl">Court terme 5j</div><div class="hbar"><div class="hfill" id="h-ct" style="width:0;left:50%;background:var(--g)"></div></div><div class="hval" id="v-ct">---</div></div>
+    <div class="hrow"><div class="hlbl">Moyen terme 20j</div><div class="hbar"><div class="hfill" id="h-mt" style="width:0;left:50%;background:var(--g)"></div></div><div class="hval" id="v-mt">---</div></div>
+    <div class="hrow"><div class="hlbl">Long terme 60j</div><div class="hbar"><div class="hfill" id="h-lt" style="width:0;left:50%;background:var(--g)"></div></div><div class="hval" id="v-lt">---</div></div>
+    <div class="hrow"><div class="hlbl">Modèle ML</div><div class="hbar"><div class="hfill" id="h-ml" style="width:0;left:50%;background:var(--b)"></div></div><div class="hval b" id="v-ml">---</div></div>
+    <div class="sep"></div>
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;font-size:11px;font-family:var(--mono)">
+      <div><div class="muted">MA20</div><div id="ma20">---</div></div>
+      <div><div class="muted">MA50</div><div id="ma50">---</div></div>
+      <div><div class="muted">MA200</div><div id="ma200">---</div></div>
+      <div><div class="muted">Support</div><div class="a" id="sup">---</div></div>
+      <div><div class="muted">Résistance</div><div style="color:var(--p)" id="res">---</div></div>
+      <div><div class="muted">RSI 14</div><div id="rsi">---</div></div>
+    </div>
+  </div>
+
+  <!-- Assets -->
+  <div class="card">
+    <div class="card-h">Multi-actifs</div>
+    <div id="assets">
+      <div class="muted" style="font-size:11px">Chargement...</div>
+    </div>
+    <div class="sep"></div>
+    <div class="card-h">Indicateurs techniques</div>
+    <div>
+      <div class="irow"><div class="ik">MACD hist.</div><div class="iv" id="i-macd">---</div></div>
+      <div class="irow"><div class="ik">Bollinger Z-score</div><div class="iv" id="i-bb">---</div></div>
+      <div class="irow"><div class="ik">Momentum 5j</div><div class="iv" id="i-mom">---</div></div>
+      <div class="irow"><div class="ik">Écart vs MA20</div><div class="iv" id="i-e20">---</div></div>
+      <div class="irow"><div class="ik">Écart vs MA50</div><div class="iv" id="i-e50">---</div></div>
+      <div class="irow"><div class="ik">Écart vs MA200</div><div class="iv" id="i-e200">---</div></div>
+    </div>
+  </div>
+
+  <!-- Régimes VIX -->
+  <div class="card">
+    <div class="card-h">Analyse par régime VIX</div>
+    <div class="rblock rcalme"><div class="rblock-title g">Très calme — VIX &lt; 15</div><div class="rblock-sub">Hit Rate <b>61.1%</b> · Sharpe <b>5.07</b> · 1 062 j.</div></div>
+    <div class="rblock rcalme2"><div class="rblock-title b">Calme — VIX 15-20</div><div class="rblock-sub">Hit Rate <b>55.0%</b> · Sharpe <b>2.29</b> · 962 j.</div></div>
+    <div class="rblock rstress"><div class="rblock-title a">Volatil — VIX 20-30</div><div class="rblock-sub">Hit Rate <b>46.4%</b> · Sharpe <b>-0.96</b> · 705 j.</div></div>
+    <div class="rblock rcrash"><div class="rblock-title r">Extrême — VIX &gt; 30</div><div class="rblock-sub">Hit Rate <b>37.3%</b> · Sharpe <b>-2.62</b> · 158 j.</div></div>
+    <div class="sep"></div>
+    <div class="card-h">Corrélations clés</div>
+    <div class="irow"><div class="ik">SP500 / VIX</div><div class="iv r">-0.727</div></div>
+    <div class="irow"><div class="ik">SP500 / BTC</div><div class="iv b">+0.238</div></div>
+    <div class="irow"><div class="ik">SP500 / Gold</div><div class="iv">+0.040</div></div>
+    <div class="irow"><div class="ik">Gold / DXY</div><div class="iv r">-0.382</div></div>
+  </div>
+</div>
+
+<!-- PERFORMANCE CHARTS -->
+<div class="g2">
+  <div class="card">
+    <div class="card-h">Performance cumulée — Régime CALME
+      <span>ML +43% · B&H +53% · Binaire +41%</span>
+    </div>
+    <div style="display:flex;gap:14px;margin-bottom:10px" id="leg-calme"></div>
+    <div style="height:190px;position:relative"><canvas id="ch-calme" role="img" aria-label="Performance cumulée régime calme: ML Alloc +43%, Buy and Hold +53%, Binaire +41%"></canvas></div>
+  </div>
+  <div class="card">
+    <div class="card-h">Performance cumulée — Régime STRESS
+      <span>ML +27% · B&H +27% · Binaire +27%</span>
+    </div>
+    <div style="display:flex;gap:14px;margin-bottom:10px" id="leg-stress"></div>
+    <div style="height:190px;position:relative"><canvas id="ch-stress" role="img" aria-label="Performance cumulée régime stress: ML Alloc +27%, Buy and Hold +27%, MaxDD réduit de -15% à -5%"></canvas></div>
+  </div>
+</div>
+
+<!-- SHAP + HISTORIQUE -->
+<div class="g31">
+  <div class="card">
+    <div class="card-h">Historique des signaux de tendance
+      <span id="hist-count">--- entrées</span>
+    </div>
+    <div style="overflow-x:auto" id="hist-box">
+      <div class="muted" style="font-size:11px">Chargement...</div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-h">SHAP — Feature importance</div>
+    <div class="tabs">
+      <button class="tab on" onclick="shap('calme',this)">Calme</button>
+      <button class="tab"    onclick="shap('stress',this)">Stress</button>
+    </div>
+    <div id="shap-calme">
+      <div class="frow"><div class="frk">1</div><div class="fn">MACD Histogram</div><div class="fb"><div class="ff" style="width:100%;background:var(--b)"></div></div><div class="fp">0.069</div></div>
+      <div class="frow"><div class="frk">2</div><div class="fn">Fear &amp; Greed Index</div><div class="fb"><div class="ff" style="width:98%;background:var(--b)"></div></div><div class="fp">0.068</div></div>
+      <div class="frow"><div class="frk">3</div><div class="fn">Bollinger Z-score</div><div class="fb"><div class="ff" style="width:93%;background:var(--b)"></div></div><div class="fp">0.064</div></div>
+      <div class="frow"><div class="frk">4</div><div class="fn">VIX Percentile 252j</div><div class="fb"><div class="ff" style="width:80%;background:var(--p)"></div></div><div class="fp">0.055</div></div>
+      <div class="frow"><div class="frk">5</div><div class="fn">ADX — Force tendance</div><div class="fb"><div class="ff" style="width:74%;background:var(--p)"></div></div><div class="fp">0.051</div></div>
+      <div class="frow"><div class="frk">6</div><div class="fn">Z-score Prix 20j</div><div class="fb"><div class="ff" style="width:72%;background:var(--g)"></div></div><div class="fp">0.050</div></div>
+      <div class="frow"><div class="frk">7</div><div class="fn">Q4 Saisonnalité</div><div class="fb"><div class="ff" style="width:67%;background:var(--g)"></div></div><div class="fp">0.046</div></div>
+      <div class="frow"><div class="frk">8</div><div class="fn">Corr SP500/VIX 20j</div><div class="fb"><div class="ff" style="width:60%;background:var(--a)"></div></div><div class="fp">0.041</div></div>
+      <div class="frow"><div class="frk">9</div><div class="fn">Delta VIX 1j</div><div class="fb"><div class="ff" style="width:56%;background:var(--a)"></div></div><div class="fp">0.039</div></div>
+      <div class="frow"><div class="frk">10</div><div class="fn">Rendement 3j</div><div class="fb"><div class="ff" style="width:55%;background:var(--a)"></div></div><div class="fp">0.038</div></div>
+    </div>
+    <div id="shap-stress" style="display:none">
+      <div class="frow"><div class="frk">1</div><div class="fn">Fear &amp; Greed Extrême</div><div class="fb"><div class="ff" style="width:100%;background:var(--r)"></div></div><div class="fp">0.075</div></div>
+      <div class="frow"><div class="frk">2</div><div class="fn">ATR normalisé</div><div class="fb"><div class="ff" style="width:71%;background:var(--r)"></div></div><div class="fp">0.054</div></div>
+      <div class="frow"><div class="frk">3</div><div class="fn">VIX Spike vs MA20</div><div class="fb"><div class="ff" style="width:66%;background:var(--r)"></div></div><div class="fp">0.050</div></div>
+      <div class="frow"><div class="frk">4</div><div class="fn">Bollinger Z-score</div><div class="fb"><div class="ff" style="width:72%;background:var(--a)"></div></div><div class="fp">0.054</div></div>
+      <div class="frow"><div class="frk">5</div><div class="fn">Drawdown 50j</div><div class="fb"><div class="ff" style="width:55%;background:var(--a)"></div></div><div class="fp">0.041</div></div>
+      <div class="frow"><div class="frk">6</div><div class="fn">Delta VIX 1j</div><div class="fb"><div class="ff" style="width:55%;background:var(--a)"></div></div><div class="fp">0.041</div></div>
+      <div class="frow"><div class="frk">7</div><div class="fn">VIX Niveau</div><div class="fb"><div class="ff" style="width:56%;background:var(--a)"></div></div><div class="fp">0.042</div></div>
+      <div class="frow"><div class="frk">8</div><div class="fn">Drawdown 20j</div><div class="fb"><div class="ff" style="width:47%;background:var(--t3)"></div></div><div class="fp">0.035</div></div>
+      <div class="frow"><div class="frk">9</div><div class="fn">Corrélation SP/VIX</div><div class="fb"><div class="ff" style="width:45%;background:var(--t3)"></div></div><div class="fp">0.034</div></div>
+      <div class="frow"><div class="frk">10</div><div class="fn">RSI 2 survente</div><div class="fb"><div class="ff" style="width:45%;background:var(--t3)"></div></div><div class="fp">0.034</div></div>
+    </div>
+  </div>
+</div>
+
+<!-- FOOTER -->
+<div style="border-top:1px solid var(--bd);padding-top:12px;display:flex;justify-content:space-between;align-items:center">
+  <div style="font-size:10px;font-family:var(--mono);color:var(--t3)">RF 30% · XGBoost 50% · LR 20% · Walk-forward 5 folds · Zero data leakage</div>
+  <div style="font-size:10px;font-family:var(--mono);color:var(--t3)">Auto-refresh 60s · <span id="cd">60</span>s</div>
+</div>
+
+</div><!-- .wrap -->
+
 <script>
-let chartCalme  = null;
-let chartStress = null;
-let countdown   = 60;
-let countTimer  = null;
+let charts = {};
+let cdVal  = 60;
+let cdTimer;
 
-function fmt(n, d=2) { return parseFloat(n).toFixed(d); }
-function fmtPrix(n)  { return parseFloat(n).toLocaleString('fr-FR', {minimumFractionDigits:2, maximumFractionDigits:2}); }
+// Horloge
+setInterval(()=>{ document.getElementById('clock').textContent = new Date().toLocaleTimeString('fr-FR'); }, 1000);
+document.getElementById('clock').textContent = new Date().toLocaleTimeString('fr-FR');
 
-function tick() {
-  const now = new Date();
-  document.getElementById('clock').textContent =
-    now.toLocaleTimeString('fr-FR');
-}
-tick();
-setInterval(tick, 1000);
-
-function startCountdown() {
-  countdown = 60;
-  if(countTimer) clearInterval(countTimer);
-  countTimer = setInterval(() => {
-    countdown--;
-    const el = document.getElementById('next-refresh');
-    if(el) el.textContent = countdown;
-    if(countdown <= 0) loadData();
+// Countdown
+function startCd() {
+  cdVal = 60;
+  clearInterval(cdTimer);
+  cdTimer = setInterval(()=>{
+    cdVal--;
+    const el = document.getElementById('cd');
+    if(el) el.textContent = cdVal;
+    if(cdVal <= 0) load();
   }, 1000);
 }
 
-function setStatus(ok, msg) {
-  const bar = document.getElementById('status-bar');
-  const txt = document.getElementById('status-text');
-  if(txt) txt.textContent = msg;
-  if(bar) bar.style.borderLeft = ok ? '3px solid var(--green)' : '3px solid var(--red)';
-}
+// Helpers
+const $ = id => document.getElementById(id);
+const fmt = (v,d=2) => parseFloat(v||0).toFixed(d);
+const fmtP = v => parseFloat(v||0).toLocaleString('fr-FR',{minimumFractionDigits:2,maximumFractionDigits:2});
+const sign = v => v>=0?'+':'';
+const col  = v => v>=0?'var(--g)':'var(--r)';
+const colClass = v => v>=0?'g':'r';
 
-function sigClass(couleur) {
-  return {green:'sig-green', red:'sig-red', amber:'sig-amber', gray:'sig-gray'}[couleur] || 'sig-gray';
-}
-
-function barColor(score) {
-  return score >= 0 ? 'var(--green)' : 'var(--red)';
-}
-
-function buildLegend(id, items) {
-  const el = document.getElementById(id);
+function legend(id, items) {
+  const el = $(id);
   if(!el) return;
-  el.innerHTML = items.map(i =>
-    `<span style="display:flex;align-items:center;gap:4px;font-size:10px;color:#94a3b8">
-      <span style="width:10px;height:3px;background:${i.c};border-radius:2px;display:inline-block"></span>
-      ${i.label}
+  el.innerHTML = items.map(i=>
+    `<span style="display:flex;align-items:center;gap:5px;font-size:10px;font-family:var(--mono);color:var(--t2)">
+      <span style="width:12px;height:2px;background:${i.c};display:inline-block;border-radius:1px"></span>${i.l}
     </span>`).join('');
 }
 
-function buildChart(id, labels, datasets) {
-  const ctx = document.getElementById(id);
+function mkChart(id, labels, datasets) {
+  const ctx = $(id);
   if(!ctx) return null;
-  return new Chart(ctx, {
-    type: 'line',
-    data: { labels, datasets },
-    options: {
-      responsive: true, maintainAspectRatio: false,
-      plugins: {
-        legend: { display: false },
-        tooltip: {
-          mode: 'index', intersect: false,
-          backgroundColor: '#0d1320', borderColor: '#1e2d45', borderWidth: 1,
-          titleColor: '#94a3b8', bodyColor: '#e2e8f0',
-          callbacks: { label: c => ` ${c.dataset.label}: ${parseFloat(c.parsed.y).toFixed(1)}%` }
+  if(charts[id]) { charts[id].destroy(); }
+  charts[id] = new Chart(ctx, {
+    type:'line', data:{labels, datasets},
+    options:{
+      responsive:true, maintainAspectRatio:false,
+      plugins:{
+        legend:{display:false},
+        tooltip:{
+          mode:'index', intersect:false,
+          backgroundColor:'#161b22', borderColor:'#30363d', borderWidth:1,
+          titleColor:'#8b949e', bodyColor:'#f0f6fc',
+          callbacks:{label:c=>` ${c.dataset.label}: ${parseFloat(c.parsed.y).toFixed(1)}%`}
         }
       },
-      scales: {
-        x: { grid:{color:'rgba(148,163,184,.07)'}, ticks:{color:'#4a5568',font:{size:9},maxRotation:0,maxTicksLimit:6} },
-        y: { grid:{color:'rgba(148,163,184,.07)'}, ticks:{color:'#4a5568',font:{size:9},callback:v=>v.toFixed(0)+'%'} }
+      scales:{
+        x:{grid:{color:'rgba(240,246,252,.04)'}, ticks:{color:'#484f58',font:{size:9,family:'JetBrains Mono'},maxRotation:0,maxTicksLimit:7}},
+        y:{grid:{color:'rgba(240,246,252,.04)'}, ticks:{color:'#484f58',font:{size:9,family:'JetBrains Mono'},callback:v=>v.toFixed(0)+'%'}}
       },
-      interaction: { mode:'index', intersect:false }
+      interaction:{mode:'index',intersect:false}
     }
   });
+  return charts[id];
 }
 
-function updateChart(chart, labels, datasets) {
-  if(!chart) return;
-  chart.data.labels = labels;
-  chart.data.datasets = datasets;
-  chart.update('none');
+function ds(label, data, color, dash) {
+  return {
+    label, data,
+    borderColor:color, backgroundColor:color+'14',
+    fill:!dash, tension:.4, pointRadius:0, borderWidth:dash?1.5:2,
+    borderDash:dash?[5,3]:undefined
+  };
 }
 
-async function loadData() {
-  setStatus(true, 'Actualisation...');
-  startCountdown();
+// SHAP tabs
+function shap(r, btn) {
+  $('shap-calme').style.display  = r==='calme'  ? '':'none';
+  $('shap-stress').style.display = r==='stress' ? '':'none';
+  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('on'));
+  btn.classList.add('on');
+}
+
+// MAIN LOAD
+async function load() {
+  startCd();
   try {
-    const res  = await fetch('/api/data');
-    const data = await res.json();
+    const d = await fetch('/api/data').then(r=>r.json());
+    $('ts').textContent = d.ts || '---';
 
-    document.getElementById('last-update').textContent = data.timestamp;
+    // KPI
+    const sp = d.marche?.sp500 || {};
+    const vx = d.marche?.vix  || {};
+    const sig = d.signal || {};
+    const ten = d.tendance || {};
 
-    // ── MARCHÉ ──
-    const sp = data.marche?.sp500 || {};
-    const vx = data.marche?.vix  || {};
+    $('k-sp').textContent  = fmtP(sp.prix);
+    $('k-sp').className    = 'sc-val '+(sp.var>=0?'g':'r');
+    $('k-spv').innerHTML   = `<span class="${sp.var>=0?'g':'r'}">${sp.var>=0?'▲':'▼'} ${fmt(Math.abs(sp.var))}%</span>&nbsp;aujourd'hui`;
 
-    const spEl = document.getElementById('sp-prix');
-    if(spEl) {
-      spEl.textContent = fmtPrix(sp.prix || 0);
-      spEl.className   = 'mv ' + ((sp.variation||0) >= 0 ? 'green' : 'red');
-    }
-    const spVar = document.getElementById('sp-var');
-    if(spVar) {
-      const v = sp.variation || 0;
-      spVar.innerHTML = `<span class="${v>=0?'green':'red'}">${v>=0?'▲':'▼'} ${fmt(Math.abs(v))}%</span>&nbsp;aujourd'hui`;
-    }
+    $('k-vix').textContent = fmt(vx.prix,1);
+    const regColors = {calme:'var(--b)',stress:'var(--a)',crash:'var(--r)'};
+    const regLabels = {calme:'CALME',stress:'STRESS',crash:'CRASH'};
+    $('k-reg').innerHTML   = `<span style="color:${regColors[sig.regime]||'var(--b)'};font-size:10px;font-family:var(--mono);background:${regColors[sig.regime]||'var(--b)'}18;padding:2px 8px;border-radius:4px">${regLabels[sig.regime]||'CALME'}</span>`;
 
-    const vixEl = document.getElementById('vix-val');
-    if(vixEl) vixEl.textContent = fmt(vx.prix || 0, 1);
+    const pc = sig.proba||50;
+    $('k-prob').textContent = pc + '%';
+    $('k-prob').className   = 'sc-val '+(pc>=55?'g':pc<45?'r':'a');
 
-    // ── SIGNAL ──
-    const sig = data.signal || {};
-    const regime = sig.regime || 'calme';
-    const regColors = {calme:'#3b82f6', stress:'#f97316', crash:'#ef4444'};
-    const regEl = document.getElementById('vix-regime');
-    if(regEl) regEl.innerHTML =
-      `<span style="background:${regColors[regime]}22;color:${regColors[regime]};font-size:9px;padding:2px 7px;border-radius:4px;text-transform:uppercase">${regime}</span>`;
+    $('k-expo').textContent = (sig.expo||0) + '%';
+    $('k-expo').className   = 'sc-val '+(sig.expo>=50?'g':sig.expo>0?'a':'r');
+    $('k-sig').textContent  = sig.signal || '---';
 
-    const probaEl = document.getElementById('proba-val');
-    if(probaEl) {
-      probaEl.textContent = (sig.proba || 50) + '%';
-      probaEl.className   = 'mv ' + ((sig.proba||50) >= 55 ? 'green' : (sig.proba||50) < 45 ? 'red' : 'amber');
-    }
+    // Signal badge
+    const sigEl = $('sig-tag');
+    const cls   = {green:'sg',red:'sr',amber:'sa',gray:'sx'}[sig.couleur]||'sx';
+    const ico   = {green:'▲',red:'▼',amber:'◆',gray:'→'}[sig.couleur]||'→';
+    sigEl.textContent = ico+' '+(sig.signal||'---');
+    sigEl.className   = 'sig-tag '+cls;
+    $('sig-meta').textContent = `Conviction ${sig.conviction||'---'} · Score ${sig.score>=0?'+':''}${sig.score}/100 · Régime ${(sig.regime||'calme').toUpperCase()}`;
+    $('sig-date').textContent = sig.date||'---';
 
-    const expoEl = document.getElementById('expo-val');
-    if(expoEl) {
-      expoEl.textContent = (sig.exposition || 0) + '%';
-      expoEl.className   = 'mv ' + ((sig.exposition||0) >= 50 ? 'green' : 'amber');
-    }
-    const expoSub = document.getElementById('expo-sub');
-    if(expoSub) expoSub.textContent = sig.signal || '---';
+    // Barre proba
+    const pEl = $('pf');
+    pEl.style.width      = Math.min(100,Math.max(0,pc))+'%';
+    pEl.style.background = pc>=60?'var(--g)':pc<40?'var(--r)':'var(--a)';
 
-    const sbadge = document.getElementById('signal-badge');
-    if(sbadge) {
-      const icons = {green:'▲', red:'▼', amber:'◆', gray:'→'};
-      sbadge.textContent = (icons[sig.couleur]||'→') + ' ' + (sig.signal||'---');
-      sbadge.className   = 'sig-tag sig-' + (sig.couleur||'gray');
-    }
-    const smeta = document.getElementById('signal-meta');
-    if(smeta) smeta.textContent =
-      `Conviction ${sig.conviction||'---'} · Score ${sig.score||0}/100 · Régime ${regime.toUpperCase()}`;
-
-    const pfill = document.getElementById('proba-fill');
-    if(pfill) {
-      const p = Math.min(100, Math.max(0, sig.proba||50));
-      pfill.style.width      = p + '%';
-      pfill.style.background = p >= 60 ? 'var(--green)' : p < 40 ? 'var(--red)' : 'var(--amber)';
-    }
-
-    // ── TENDANCE ──
-    const t = data.tendance || {};
-    const scores = {ct: t.score_ct||0, mt: t.score_mt||0, lt: t.score_lt||0};
-    const mlScore = ((sig.proba||50) - 50) * 2;
-
-    [['ct',scores.ct], ['mt',scores.mt], ['lt',scores.lt], ['ml',mlScore]].forEach(([id, sc]) => {
-      const bar = document.getElementById('bar-'+id);
-      const val = document.getElementById('val-'+id);
-      if(bar) {
-        bar.style.width      = Math.min(100, Math.abs(sc)) + '%';
-        bar.style.background = sc >= 0 ? 'var(--green)' : 'var(--red)';
-      }
-      if(val) {
-        val.textContent = (sc >= 0 ? '+' : '') + fmt(sc, 0);
-        val.className   = 'rv ' + (sc >= 0 ? 'green' : 'red');
-      }
+    // Horizons
+    const mlScore = (pc-50)*2;
+    [['ct',ten.score_ct||0,'var(--g)'],
+     ['mt',ten.score_mt||0,'var(--g)'],
+     ['lt',ten.score_lt||0,'var(--g)'],
+     ['ml',mlScore,'var(--b)']
+    ].forEach(([id,sc,c])=>{
+      const h = $('h-'+id), v = $('v-'+id);
+      if(h){ h.style.width=Math.min(50,Math.abs(sc)/2)+'%'; h.style.background=sc>=0?c:'var(--r)'; h.style.left=sc>=0?'50%':'calc(50% - '+Math.min(50,Math.abs(sc)/2)+'%)'; }
+      if(v){ v.textContent=(sc>=0?'+':'')+fmt(sc,0); v.className='hval '+(sc>=0?'g':'r'); }
     });
 
-    const setTxt = (id, val) => { const el=document.getElementById(id); if(el) el.textContent=val; };
+    // Niveaux
+    ['ma20','ma50','ma200'].forEach(k=>{ const el=$(k); if(el) el.textContent=fmtP(ten[k]||0); });
+    $('sup') && ($('sup').textContent  = fmtP(ten.support1||0));
+    $('res') && ($('res').textContent  = fmtP(ten.resistance||0));
+    $('rsi') && ($('rsi').textContent  = fmt(ten.rsi||0,1));
 
-    setTxt('ma20',      fmtPrix(t.ma20||0));
-    setTxt('ma50',      fmtPrix(t.ma50||0));
-    setTxt('ma200',     fmtPrix(t.ma200||0));
-    setTxt('support',   fmtPrix(t.support_1||0));
-    setTxt('resistance',fmtPrix(t.resistance||0));
-    setTxt('rsi-val',   fmt(t.rsi||0,1));
-    setTxt('macd-val',  fmt(t.macd_hist||0,4));
-    setTxt('bb-val',    fmt(t.bb_zscore||0,2));
-    setTxt('mom-val',   (t.mom5||0)>=0 ? '+'+fmt(t.mom5||0,2)+'%' : fmt(t.mom5||0,2)+'%');
-    setTxt('ema20-val', (t.ecart_ma20||0)>=0 ? '+'+fmt(t.ecart_ma20||0,2)+'%' : fmt(t.ecart_ma20||0,2)+'%');
-    setTxt('ema50-val', (t.ecart_ma50||0)>=0 ? '+'+fmt(t.ecart_ma50||0,2)+'%' : fmt(t.ecart_ma50||0,2)+'%');
-    setTxt('ema200-val',(t.ecart_ma200||0)>=0? '+'+fmt(t.ecart_ma200||0,2)+'%':fmt(t.ecart_ma200||0,2)+'%');
+    // Indicateurs
+    const setIv = (id,v,d=4)=>{ const e=$(id); if(e){e.textContent=v>=0?'+'+fmt(v,d):fmt(v,d); e.className='iv '+(v>=0?'g':'r');} };
+    setIv('i-macd', ten.macd_hist||0, 4);
+    setIv('i-bb',   ten.bb_z||0,     2);
+    setIv('i-mom',  ten.mom5||0,     2);
+    setIv('i-e20',  ten.ecart20||0,  2);
+    setIv('i-e50',  ten.ecart50||0,  2);
+    setIv('i-e200', ten.ecart200||0, 2);
 
-    // ── ASSETS ──
-    const sigMap = (v) => v>=1?'ACHAT':v<=-0.5?'VENTE':'NEU';
-    const clsMap = (v) => v>=0?'bg':v<-0.5?'br':'bx';
-    const assetBox = document.getElementById('assets-box');
-    if(assetBox) {
-      const actifs = ['sp500','vix','bitcoin','gold','dxy'];
-      assetBox.innerHTML = actifs.map(nom => {
-        const a = data.marche?.[nom] || {};
-        const v = a.variation || 0;
-        const cls = clsMap(v);
-        const badge = nom==='vix'?(v<0?'<span class="abadge bg">BON</span>':'<span class="abadge bx">NEU</span>'):
-                      `<span class="abadge ${cls}">${v>=1?'ACHAT':v<=-1?'VENTE':'NEU'}</span>`;
+    // Assets
+    const assetEl = $('assets');
+    if(assetEl){
+      const keys = ['sp500','vix','bitcoin','gold','dxy'];
+      assetEl.innerHTML = keys.map(k=>{
+        const a = d.marche?.[k]||{};
+        const vv = a.var||0;
+        const badge = k==='vix'
+          ? (vv<0?'<span class="abadge bag">BON</span>':'<span class="abadge bax">NEU</span>')
+          : `<span class="abadge ${Math.abs(vv)>=1?(vv>0?'bag':'bar'):'bax'}">${Math.abs(vv)>=1?(vv>0?'ACHAT':'VENTE'):'NEU'}</span>`;
         return `<div class="arow">
-          <div class="ati" style="color:var(--blue)">${a.ticker||nom.toUpperCase()}</div>
-          <div class="an">${a.label||nom}</div>
-          <div class="ap">${fmtPrix(a.prix||0)}</div>
-          <div class="ac ${v>=0?'green':'red'}">${v>=0?'▲':'▼'} ${fmt(Math.abs(v),2)}%</div>
+          <div class="atic b">${a.ticker||k}</div>
+          <div class="an">${a.label||k}</div>
+          <div class="ap">${fmtP(a.prix)}</div>
+          <div class="av ${vv>=0?'g':'r'}">${vv>=0?'▲':'▼'} ${fmt(Math.abs(vv))}%</div>
           ${badge}
         </div>`;
       }).join('');
     }
 
-    // ── CHARTS PERF ──
-    const perf = data.perf || {};
-    const dsCalme = [
-      { label:'ML Alloc.', data:(perf.calme?.ml||[]),  borderColor:'#22c55e', backgroundColor:'rgba(34,197,94,.05)', fill:true, tension:.4, pointRadius:0, borderWidth:2 },
-      { label:'Buy&Hold',  data:(perf.calme?.bh||[]),  borderColor:'#4a5568', backgroundColor:'transparent', fill:false, tension:.4, pointRadius:0, borderWidth:1.5, borderDash:[5,3] },
-      { label:'Binaire',   data:(perf.calme?.bin||[]), borderColor:'#3b82f6', backgroundColor:'transparent', fill:false, tension:.4, pointRadius:0, borderWidth:1.5 },
-    ];
-    const dsStress = [
-      { label:'ML Alloc.', data:(perf.stress?.ml||[]),  borderColor:'#22c55e', backgroundColor:'rgba(34,197,94,.05)', fill:true, tension:.4, pointRadius:0, borderWidth:2 },
-      { label:'Buy&Hold',  data:(perf.stress?.bh||[]),  borderColor:'#4a5568', backgroundColor:'transparent', fill:false, tension:.4, pointRadius:0, borderWidth:1.5, borderDash:[5,3] },
-      { label:'Binaire',   data:(perf.stress?.bin||[]), borderColor:'#3b82f6', backgroundColor:'transparent', fill:false, tension:.4, pointRadius:0, borderWidth:1.5 },
-    ];
+    // Charts perf
+    const p = d.perf||{};
+    ['calme','stress'].forEach(r=>{
+      const pd = p[r]||{};
+      const lbs = pd.dates||[];
+      if(!lbs.length) return;
+      legend('leg-'+r, [
+        {c:'var(--g)',l:'ML Alloc.'},
+        {c:'#484f58',l:'Buy&Hold'},
+        {c:'var(--b)',l:'Binaire'},
+      ]);
+      mkChart('ch-'+r, lbs, [
+        ds('ML Alloc.', pd.ml||[], 'var(--g)'),
+        ds('Buy&Hold',  pd.bh||[], '#484f58', true),
+        ds('Binaire',   pd.bin||[],'var(--b)', true),
+      ]);
+    });
 
-    buildLegend('legend-calme', [{c:'#22c55e',label:'ML Alloc.'},{c:'#4a5568',label:'Buy&Hold'},{c:'#3b82f6',label:'Binaire'}]);
-    buildLegend('legend-stress',[{c:'#22c55e',label:'ML Alloc.'},{c:'#4a5568',label:'Buy&Hold'},{c:'#3b82f6',label:'Binaire'}]);
-
-    if(!chartCalme) chartCalme = buildChart('chartCalme', perf.calme?.dates||[], dsCalme);
-    else updateChart(chartCalme, perf.calme?.dates||[], dsCalme);
-
-    if(!chartStress) chartStress = buildChart('chartStress', perf.stress?.dates||[], dsStress);
-    else updateChart(chartStress, perf.stress?.dates||[], dsStress);
-
-    // ── HISTORIQUE TENDANCES ──
-    const hist = data.historique || [];
-    const histBox = document.getElementById('hist-box');
-    if(histBox && hist.length > 0) {
-      const cols = ['date','score_global','score_ct','score_mt','score_lt','tendance_global','conviction','vix','regime'];
-      histBox.innerHTML = `<table style="width:100%;border-collapse:collapse;font-size:10px">
-        <thead><tr>${['Date','Score','CT','MT','LT','Tendance','Conv.','VIX','Régime'].map(h=>
-          `<th style="padding:5px 8px;text-align:left;color:var(--t3);border-bottom:0.5px solid var(--bd);font-weight:500">${h}</th>`).join('')}</tr></thead>
-        <tbody>${[...hist].reverse().map(row => {
-          const sc = parseFloat(row.score_global||0);
-          const col = sc>20?'var(--green)':sc<-20?'var(--red)':'var(--amber)';
-          return `<tr style="border-bottom:0.5px solid var(--bd)">
-            <td style="padding:5px 8px;color:var(--t2)">${(row.date||'').substring(0,10)}</td>
-            <td style="padding:5px 8px;font-weight:500;color:${col}">${sc>=0?'+':''}${sc.toFixed(1)}</td>
-            <td style="padding:5px 8px;color:${parseFloat(row.score_ct||0)>=0?'var(--green)':'var(--red)'}">${parseFloat(row.score_ct||0).toFixed(0)}</td>
-            <td style="padding:5px 8px;color:${parseFloat(row.score_mt||0)>=0?'var(--green)':'var(--red)'}">${parseFloat(row.score_mt||0).toFixed(0)}</td>
-            <td style="padding:5px 8px;color:${parseFloat(row.score_lt||0)>=0?'var(--green)':'var(--red)'}">${parseFloat(row.score_lt||0).toFixed(0)}</td>
-            <td style="padding:5px 8px;color:var(--t2);max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${(row.tendance_global||'---').replace(/[▲▽▼△]/g,'').trim()}</td>
-            <td style="padding:5px 8px">${row.conviction||'---'}</td>
-            <td style="padding:5px 8px">${parseFloat(row.vix||0).toFixed(1)}</td>
-            <td style="padding:5px 8px;text-transform:capitalize">${row.regime||'---'}</td>
-          </tr>`;}).join('')}</tbody></table>`;
-    } else if(histBox) {
-      histBox.innerHTML = '<div style="font-size:10px;color:var(--t3)">Aucun historique — lance 4_prediction_tendance.py</div>';
+    // Historique
+    const hist = d.historique||[];
+    const hbox = $('hist-box');
+    const hcount = $('hist-count');
+    if(hcount) hcount.textContent = hist.length+' entrées';
+    if(hbox && hist.length>0){
+      const rows = [...hist].reverse().map(row=>{
+        const sc = parseFloat(row.score_global||0);
+        const c  = sc>20?'var(--g)':sc<-20?'var(--r)':'var(--a)';
+        return `<tr>
+          <td style="color:var(--t2)">${(row.date||'').substring(0,10)}</td>
+          <td style="color:${c};font-weight:600">${sc>=0?'+':''}${sc.toFixed(1)}</td>
+          <td style="color:${parseFloat(row.score_ct||0)>=0?'var(--g)':'var(--r)'}">${parseFloat(row.score_ct||0).toFixed(0)}</td>
+          <td style="color:${parseFloat(row.score_mt||0)>=0?'var(--g)':'var(--r)'}">${parseFloat(row.score_mt||0).toFixed(0)}</td>
+          <td style="color:${parseFloat(row.score_lt||0)>=0?'var(--g)':'var(--r)'}">${parseFloat(row.score_lt||0).toFixed(0)}</td>
+          <td>${(row.tendance_global||'---').replace(/[▲▽▼△↑↓]/g,'').trim()}</td>
+          <td style="color:${row.conviction==='FORTE'?'var(--g)':row.conviction==='FAIBLE'?'var(--r)':'var(--a)'}">${row.conviction||'---'}</td>
+          <td>${parseFloat(row.vix||0).toFixed(1)}</td>
+          <td style="text-transform:capitalize">${row.regime||'---'}</td>
+        </tr>`;
+      }).join('');
+      hbox.innerHTML = `<table class="htable">
+        <thead><tr><th>Date</th><th>Score</th><th>CT</th><th>MT</th><th>LT</th><th>Tendance</th><th>Conv.</th><th>VIX</th><th>Régime</th></tr></thead>
+        <tbody>${rows}</tbody></table>`;
+    } else if(hbox){
+      hbox.innerHTML = '<div class="muted" style="font-size:11px;font-family:var(--mono)">Aucun historique — lance 4_prediction_tendance.py d\'abord</div>';
     }
 
-    setStatus(true, `Données chargées · ${data.timestamp} · Modèle: ${sig.modele_ok ? 'OK ✓' : 'Absent — lance 2_train_models_FINAL.py'}`);
-
-  } catch(err) {
-    setStatus(false, 'Erreur connexion : ' + err.message);
-    console.error(err);
+  } catch(e) {
+    console.error('Erreur load:', e);
+    $('ts').textContent = 'Erreur: '+e.message;
   }
 }
 
-loadData();
-setInterval(loadData, 60000);
+load();
+setInterval(load, 60000);
 </script>
 </body>
 </html>"""
 
-
 @app.route('/')
 def index():
-    return render_template_string(HTML)
-
-
-# ─────────────────────────────────────────────────────────────
-# LANCEMENT
-# ─────────────────────────────────────────────────────────────
+    return render_template_string(PAGE)
 
 if __name__ == '__main__':
-    print("=" * 55)
-    print("  S&P 500 ML PREDICTOR — DASHBOARD LIVE")
-    print("=" * 55)
-    print(f"  Base SQLite : {DB_PATH}")
-    print(f"  URL         : http://localhost:5000")
-    print(f"  Actualisation auto : toutes les 60 secondes")
-    print("=" * 55)
-    print("  Ctrl+C pour arrêter")
-    print()
-
+    print("="*55)
+    print("  S&P 500 ML PREDICTOR — DASHBOARD v2")
+    print("="*55)
+    print(f"  SQLite  : {DB_PATH}")
+    print(f"  URL     : http://localhost:5000")
+    print(f"  Refresh : toutes les 60 secondes")
+    print("="*55)
     if not os.path.exists(DB_PATH):
-        print(f"  ATTENTION : {DB_PATH} introuvable.")
-        print("  Lance d'abord : python 01_init_data.py")
-
-    app.run(debug=False, port=5000, host='0.0.0.0')
+        print(f"\n  ATTENTION : {DB_PATH} introuvable")
+        print("  Lance : python 01_init_data.py")
+    app.run(host='0.0.0.0', port=5000, debug=False)

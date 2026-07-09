@@ -412,7 +412,7 @@ if __name__ == "__main__":
 
     # Charger le dataset
     conn = sqlite3.connect(DB_PATH)
-    df   = pd.read_sql("SELECT * FROM sp500_ml_features",
+    df   = pd.read_sql("SELECT * FROM sp500_extreme_features",
                         conn, index_col='date', parse_dates=['date'])
     conn.close()
     df.sort_index(inplace=True)
@@ -514,3 +514,5 @@ if __name__ == "__main__":
 
     print("\nTerminé ✓")
     print("Lance : python 3_allocation_dynamique.py")
+
+

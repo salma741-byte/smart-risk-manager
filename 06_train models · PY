@@ -32,7 +32,7 @@ os.makedirs("results", exist_ok=True)
 
 def charger_donnees():
     conn = sqlite3.connect(DB_PATH)
-    df   = pd.read_sql("SELECT * FROM sp500_ml_features",
+    df   = pd.read_sql("SELECT * FROM sp500_extreme_features",
                         conn, index_col='date', parse_dates=['date'])
 
     # Prix bruts pour calculs techniques
